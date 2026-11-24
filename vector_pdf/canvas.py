@@ -20,6 +20,7 @@ PREVIEW_FAMILIES = {
 class Canvas(QWidget):
     area = Signal(object)
     hit = Signal(object)
+    edit_hit = Signal(object)
     coordinate = Signal(object)
     zoomed = Signal(float)
     demand = Signal(object)
@@ -190,7 +191,7 @@ class Canvas(QWidget):
         self.zoomed.emit(self.zoom)
         self.refresh()
 
-    def zoom_at(self, multiplier, anchor=None):
+    def zoom_at(self, multiplier, anchor=None, *, manual=True):
         if not self.sheet_valid():
             return
         anchor = anchor if anchor is not None else QPointF(self.rect().center())
@@ -198,7 +199,11 @@ class Canvas(QWidget):
         if not invertible:
             return
         world = transform.map(anchor)
-        self.zoom = min(MAX_ZOOM, max(min(MIN_ZOOM, self.zoom), self.zoom*multiplier))
+        zoom = min(MAX_ZOOM, max(min(MIN_ZOOM, self.zoom), self.zoom*multiplier))
+        if manual:
+            self.zoom = zoom
+        else:
+            self._zoom = zoom
         self.pan += anchor-self.transform().map(world)
         self.zoomed.emit(self.zoom)
         self.refresh()
@@ -235,7 +240,7 @@ class Canvas(QWidget):
                 self.move_bounds = None
                 self.set_mode(self.mode)
                 self.update()
-            self.zoom_at(1.18**(delta/120.), event.position())
+            self.zoom_at(1.18**(delta/120.), event.position(), manual=False)
             event.accept()
 
     def mousePressEvent(self, event):
@@ -257,14 +262,23 @@ class Canvas(QWidget):
         elif left:
             self.hit.emit(self.document_point(event.position()))
 
+    def mouseDoubleClickEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton and self.mode != 'region'
+                and self.sheet_valid()):
+            self.cancel_move()
+            self.drag = None
+            self.set_mode(self.mode)
+            self.edit_hit.emit(self.document_point(event.position()))
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
         if not self.sheet_valid():
             return
         self.coordinate.emit(self.document_point(event.position()))
         if self.drag and self.drag[0] == 'pan':
             delta = event.position()-self.drag[1]
-            if not delta.isNull():
-                self.fit_page = False
             self.pan = self.drag[2]+delta
             self.refresh()
         elif self.drag and self.drag[0] == 'move':

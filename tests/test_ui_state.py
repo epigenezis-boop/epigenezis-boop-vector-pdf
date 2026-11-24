@@ -2,6 +2,7 @@ import inspect
 import math
 import os
 from pathlib import Path
+from time import monotonic, sleep
 from types import SimpleNamespace
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -9,6 +10,7 @@ os.environ.setdefault('VECTORPDF_NO_RECOVERY', '1')
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QImage, QMouseEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QListWidgetItem, QToolButton
 
 import pytest
@@ -18,6 +20,7 @@ from vector_pdf import ui as ui_module
 from vector_pdf.canvas import Canvas
 from vector_pdf.document import Document
 from vector_pdf.geometry import Sheet, point
+from vector_pdf.object_index import index_page
 from vector_pdf.render import Tile, TileCache
 from vector_pdf.ui import (
     MainWindow, MAX_TEXT_LENGTH, Workspace, about_text, pdf_target, write_ready_token,
@@ -28,7 +31,9 @@ from vector_pdf.writer import Edit, file_stamp
 
 @pytest.fixture(scope='session')
 def app():
-    return QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
+    ui_module.configure_fonts(app)
+    return app
 
 
 class FakeSettings:
@@ -447,6 +452,61 @@ def test_per_page_zoom_and_rotation_are_remembered(window, tmp_path):
     assert tab.view.rotation == 180
 
 
+def test_new_label_auto_applies_and_can_be_edited_and_deleted(window, app, tmp_path, monkeypatch):
+    tab = make_tab(window, tmp_path)
+    canvas = tab.view
+    tab.document.indexes[0] = index_page(tab.document.source, 0)
+
+    def unexpected_dialog(*args):
+        pytest.fail(f'Unexpected dialog: {args}')
+
+    def wait_until(condition):
+        deadline = monotonic()+5
+        while monotonic() < deadline:
+            app.processEvents()
+            if condition():
+                return
+            sleep(.01)
+        assert condition()
+
+    monkeypatch.setattr(window, 'ask', unexpected_dialog)
+    monkeypatch.setattr(window, 'error', unexpected_dialog)
+    window.activateWindow()
+    app.processEvents()
+    window.add()
+    QTest.keyClicks(tab.text, 'Label')
+    key = tab.selected.page, tab.selected.id
+    tab.family.setFocus()
+    app.processEvents()
+    assert key not in tab.document.edits
+    canvas.setFocus()
+    wait_until(lambda: key in tab.document.edits and not tab.busy)
+    edit = tab.document.edits[key]
+    assert edit.text == 'Label'
+
+    window.change_mode('view')
+    xy = QPointF(*point(canvas.sheet.to_screen, edit.x+2, edit.y+3))
+    position = canvas.transform().map(xy).toPoint()
+    QTest.mouseDClick(canvas, Qt.MouseButton.LeftButton, pos=position)
+    assert tab.view.mode == 'text' and tab.text.hasFocus()
+    assert tab.selected == edit
+    QTest.keyClick(tab.text, Qt.Key.Key_Home)
+    QTest.keyClick(tab.text, Qt.Key.Key_Delete)
+    QTest.keyClicks(tab.text, 'R')
+    assert tab.text.text() == 'Rabel'
+    assert tab.document.edits[key].text == 'Label'
+    QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=QPoint(7, 7))
+    wait_until(lambda: tab.document.edits[key].text == 'Rabel' and not tab.busy)
+
+    QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=position)
+    assert tab.selected.id == key[1]
+    QTest.keyClick(canvas, Qt.Key.Key_Delete)
+    wait_until(lambda: key not in tab.document.edits and not tab.busy)
+    tab.travel(-1)
+    wait_until(lambda: key in tab.document.edits and not tab.busy)
+    assert tab.document.edits[key].text == 'Rabel'
+
+
 def test_toolbar_reflows_with_readable_russian_and_english_labels(window, app):
     header = window.findChild(ui_module.Toolbar)
     brand = header.findChild(QLabel, 'brand')
@@ -492,6 +552,29 @@ def test_fit_page_tracks_viewport_and_manual_zoom_survives_resize(window, app, t
     assert canvas.zoom == manual
     window.actions['fit'].trigger()
     assert_fitted()
+    wheel = SimpleNamespace(
+        angleDelta=lambda: QPoint(0, 120),
+        pixelDelta=lambda: QPoint(),
+        position=lambda: QPointF(canvas.rect().center()),
+        accept=lambda: None,
+    )
+    fitted_zoom = canvas.zoom
+    canvas.wheelEvent(wheel)
+    assert canvas.zoom > fitted_zoom
+    assert canvas.fit_page
+
+    start = canvas.rect().center()
+    initial_pan = QPointF(canvas.pan)
+    QTest.mousePress(canvas, Qt.MouseButton.MiddleButton, pos=start)
+    QTest.mouseMove(canvas, start+QPoint(60, 25))
+    QTest.mouseRelease(canvas, Qt.MouseButton.MiddleButton, pos=start+QPoint(60, 25))
+    assert canvas.pan != initial_pan
+    assert canvas.fit_page
+
+    window.resize(1160, 810)
+    app.processEvents()
+    assert_fitted()
+
 
 
 def test_tile_order_fit_clamp_and_peek_stats(window):

@@ -328,6 +328,7 @@ class Workspace(QWidget):
         self.sheet_loaded = set()
         self.current = 0
         self.selected = None
+        self.auto_apply = False
         self.results = {}
         self.edit_color = None
         self.position_draft = None
@@ -356,6 +357,7 @@ class Workspace(QWidget):
         self.view.set_mode('view')
         self.view.demand.connect(self.demand)
         self.view.hit.connect(self.hit)
+        self.view.edit_hit.connect(lambda xy: self.hit(xy, focus_text=True))
         self.view.area.connect(self.area)
         self.view.zoomed.connect(lambda _: self.status())
         self.view.coordinate.connect(self.position)
@@ -396,6 +398,7 @@ class Workspace(QWidget):
         rl.addWidget(self.matches)
 
         self.form = QWidget()
+        QApplication.instance().focusChanged.connect(self.form_focus_changed)
         fields = QFormLayout(self.form)
         fields.setContentsMargins(0, 2, 0, 0)
         self.text = QLineEdit()
@@ -737,6 +740,7 @@ class Workspace(QWidget):
 
     def clear_selection(self):
         self.selected = None
+        self.auto_apply = False
         self.drag_origin = self.position_draft = None
         self.view.cancel_move()
         self.view.move_enabled = False
@@ -755,24 +759,40 @@ class Workspace(QWidget):
         except Exception:
             LOG.exception('Could not read the property draft')
             return None
+        if self.auto_apply and not self.selected.text and edit is not None and not edit.text:
+            return None
         return edit if edit is not None and edit != self.selected else None
 
     def has_draft(self):
         return self.current_draft() is not None
+
+    def form_focus_changed(self, previous, current):
+        if (self.auto_apply and previous is not None and self.form.isAncestorOf(previous)
+                and (current is None or not self.form.isAncestorOf(current))):
+            QTimer.singleShot(0, self, self.finish_text_input)
+
+    def finish_text_input(self):
+        focus = QApplication.focusWidget()
+        if (self.closed or self.busy or not self.auto_apply or self.view.drag
+                or (focus is not None and self.form.isAncestorOf(focus))):
+            return
+        self.apply()
 
     def resolve_draft(self, action, canceled=None):
         """Ask before throwing away text that is still only in the form."""
         if not self.has_draft():
             action()
             return True
-        answer = self.window.ask(
-            self.lang.get('Несохранённые изменения', 'Unapplied change'),
-            self.lang.get('Применить текущий текст перед продолжением?',
-                          'Apply the current text before continuing?'),
-            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
+        answer = QMessageBox.StandardButton.Apply
+        if not self.auto_apply:
+            answer = self.window.ask(
+                self.lang.get('Несохранённые изменения', 'Unapplied change'),
+                self.lang.get('Применить текущий текст перед продолжением?',
+                              'Apply the current text before continuing?'),
+                QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
         if answer == QMessageBox.StandardButton.Apply:
             self.pending_action = action
             if not self.apply():
@@ -828,27 +848,30 @@ class Workspace(QWidget):
             self.notice('Нажмите на текст. Средняя кнопка мыши перемещает лист.',
                         'Click text. Drag with the middle button to pan.')
 
-    def hit(self, xy):
+    def hit(self, xy, focus_text=False):
         margin = 7 / max(self.view.zoom, .01)
         x, y = xy
-        self.query((x-margin, y-margin, x+margin, y+margin), xy)
+        self.query((x-margin, y-margin, x+margin, y+margin), xy, focus_text)
 
     def area(self, bounds):
         if bounds[2]-bounds[0] < 1e-5 or bounds[3]-bounds[1] < 1e-5:
             return self.hit(bounds[:2])
         self.query(bounds, None)
 
-    def query(self, bounds, xy):
+    def query(self, bounds, xy, focus_text=False):
         if self.busy or not self.sheets or self.read_only or not self.permission_checked:
             return
         if self.current not in self.sheet_loaded:
             self.notice('Подождите, пока загрузятся размеры листа.', 'Wait until the sheet dimensions load.')
             return
+        if self.auto_apply and self.has_draft():
+            self.resolve_draft(lambda: self.query(bounds, xy, focus_text))
+            return
         number = self.current
         if number in self.document.indexes:
-            self.display_query(bounds, xy, self.document.indexes[number])
+            self.display_query(bounds, xy, self.document.indexes[number], focus_text)
             return
-        self.pending_area = number, bounds, xy
+        self.pending_area = number, bounds, xy, focus_text
         self.notice('Индексируем текст листа…', 'Indexing text on this sheet…')
         if number not in self.indexing:
             self.indexing.add(number)
@@ -870,11 +893,11 @@ class Workspace(QWidget):
         self.document.metrics.index = index.elapsed*1000
         self.document.metrics.objects = index.objects
         if self.pending_area and self.pending_area[0] == number and number == self.current:
-            _, bounds, xy = self.pending_area
+            _, bounds, xy, focus_text = self.pending_area
             self.pending_area = None
-            self.display_query(bounds, xy, index)
+            self.display_query(bounds, xy, index, focus_text)
 
-    def display_query(self, bounds, xy, index):
+    def display_query(self, bounds, xy, index, focus_text=False):
         start = perf_counter()
         self.active_area = bounds if xy is None else None
         runs = {r.id: self.document.get(self.current, r) for r in index.area(bounds)
@@ -894,7 +917,12 @@ class Workspace(QWidget):
             x, y = xy
             try:
                 choice = min(runs.values(), key=lambda edit: hit_distance(edit, x, y))
-                self.load_edit(choice)
+                if focus_text and self.view.mode != 'text':
+                    self.window.change_mode('text')
+                if self.load_edit(choice) and focus_text and self.form.isEnabled():
+                    self.auto_apply = True
+                    self.text.setFocus(Qt.FocusReason.MouseFocusReason)
+                    self.text.end(False)
             except Exception:
                 LOG.exception('Could not select the nearest text object')
                 self.clear_selection()
@@ -937,6 +965,7 @@ class Workspace(QWidget):
                         'This text object cannot be edited safely. ' + str(error))
             return False
         self.selected = edit
+        self.auto_apply = False
         self.position_draft = (edit.x, edit.y)
         self.drag_origin = None
         self.view.move_bounds = None
@@ -1101,6 +1130,7 @@ class Workspace(QWidget):
         try:
             if delta is None or not self.selected or self.busy:
                 self.preview_move(None)
+                self.finish_text_input()
                 return
             self.preview_move(delta)
             edit = self.view.preview
@@ -1109,10 +1139,7 @@ class Workspace(QWidget):
             if not edit or not edit.text:
                 return
             self.position_draft = (edit.x, edit.y)
-            if edit.original is None and (edit.page, edit.id) not in self.document.edits:
-                self.preview()
-            else:
-                self.edit(edit)
+            self.edit(edit)
         finally:
             self.drag_origin = None
             self.view.move_bounds = None
@@ -1151,6 +1178,7 @@ class Workspace(QWidget):
         self.view.selection = None
         self.view.update()
         self.remove_button.setEnabled(False)
+        self.auto_apply = True
         self.text.setFocus()
 
     def apply(self):
@@ -1162,11 +1190,26 @@ class Workspace(QWidget):
             LOG.exception('Could not read the edit fields')
             return False
         if not edit or not edit.text:
+            if self.auto_apply and self.selected.text and edit is not None:
+                return self.remove()
             return False
         return self.edit(edit)
 
+    def keyPressEvent(self, event):
+        if (event.key() == Qt.Key.Key_Delete and not event.isAutoRepeat()
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier and self.view.drag is None):
+            focus = QApplication.focusWidget()
+            if focus is None or isinstance(focus, QPushButton) or not self.form.isAncestorOf(focus):
+                if self.remove():
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
     def remove(self):
         if self.selected and not self.busy and self.form.isEnabled():
+            if self.selected.original is None and (self.selected.page, self.selected.id) not in self.document.edits:
+                self.clear_selection()
+                return True
             return self.edit(replace(self.selected, text=''))
         return False
 
@@ -1185,6 +1228,9 @@ class Workspace(QWidget):
         return False
 
     def travel(self, step):
+        if self.auto_apply and self.has_draft():
+            self.resolve_draft(lambda: self.travel(step))
+            return
         target = self.document.cursor+step
         if not self.busy and 0 <= target < len(self.document.states):
             self.change_state(self.document.states[target], target, None)
@@ -2082,26 +2128,12 @@ class MainWindow(QMainWindow):
         if (not self._suppress_draft and previous is not None and previous is not tab
                 and self.tabs.indexOf(previous) >= 0 and not previous.closed and not previous.busy
                 and previous.has_draft()):
-            answer = self.ask(
-                self.lang.get('Неприменённый текст', 'Unapplied text'),
-                self.lang.get('Применить текущий текст перед переключением вкладки?',
-                              'Apply the current text before switching tabs?'),
-                QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Discard
-                | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer == QMessageBox.StandardButton.Apply:
+            if previous.auto_apply:
                 previous.apply()
-            elif answer == QMessageBox.StandardButton.Discard:
-                previous.clear_selection()
-            else:
-                self._suppress_draft = True
-                try:
-                    self.tabs.setCurrentWidget(previous)
-                finally:
-                    self._suppress_draft = False
+            elif not self.confirm_tab_draft(previous):
                 return
         self._active_tab = tab
+
         has = bool(self.tabs.count())
         self.empty.setVisible(not has)
         self.tabs.setVisible(has)
@@ -2116,6 +2148,28 @@ class MainWindow(QMainWindow):
         self.trim_inactive()
         self.update_actions()
         self.update_status()
+
+    def confirm_tab_draft(self, previous):
+        answer = self.ask(
+            self.lang.get('Неприменённый текст', 'Unapplied text'),
+            self.lang.get('Применить текущий текст перед переключением вкладки?',
+                          'Apply the current text before switching tabs?'),
+            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Apply:
+            previous.apply()
+        elif answer == QMessageBox.StandardButton.Discard:
+            previous.clear_selection()
+        else:
+            self._suppress_draft = True
+            try:
+                self.tabs.setCurrentWidget(previous)
+            finally:
+                self._suppress_draft = False
+            return False
+        return True
 
     def update_status(self):
         self.update_actions()
