@@ -176,17 +176,17 @@ def clipped_pdf(path, content):
     return Path(path)
 
 
-def test_clipped_text_is_read_only(tmp_path):
+def test_clipped_text_is_editable_and_reported(tmp_path):
     source = clipped_pdf(tmp_path/'clipped.pdf',
                          b'q 10 10 200 40 re W n BT /F0 20 Tf 1 0 0 1 20 20 Tm <CODE> Tj ET Q')
     run = run_named(source, 'AB')
-    assert not run.editable
+    assert run.editable
     assert run.glyphs[0].clipped
     assert 'clip' in run.reason
     destination = tmp_path/'clipped-out.pdf'
-    with pytest.raises(ValueError, match='read-only'):
-        write_copy(source, destination, [Edit.from_run(0, run)])
-    assert not destination.exists()
+    edit = replace(Edit.from_run(0, run), text='CD', y=150)
+    write_copy(source, destination, [edit])
+    assert 'CD' in page_text(destination)
 
 
 def test_paint_inside_text_block_is_read_only(tmp_path):

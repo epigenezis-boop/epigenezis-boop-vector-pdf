@@ -341,7 +341,7 @@ def bind_font(pdf, resource_fonts, family, edit):
     return key, encoded
 
 
-def rebuild(pdf, page, edits):
+def rebuild(pdf, page, edits, balanced=None):
     content = streams(page)
     try:
         page_resources = page.Resources
@@ -404,7 +404,12 @@ def rebuild(pdf, page, edits):
                     target[str(key)] = value
             content[index] = target
     if added:
-        require_balanced_page(page)
+        # The index already proved balance for the exact source revision; parsing
+        # the entire 17 MB CAD stream again would add seconds to every edit.
+        if balanced is False:
+            raise ValueError('The original page has unbalanced graphics or text scopes.')
+        if balanced is None:
+            require_balanced_page(page)
         # Isolate the original page's graphics state before appending new objects.
         content = [pdf.make_stream(b'q\n'), *content, pdf.make_stream(b'Q\n'+b''.join(added))]
     if plan or added:
@@ -526,15 +531,23 @@ def _pdfium_text(document, number):
         page.close()
 
 
-def _validate_output(path, geometry, untouched, expected):
+def _validate_output(path, geometry, untouched, expected, deep=True,
+                     allowed_warnings=()):
     try:
         with q.Pdf.open(path, attempt_recovery=False) as output:
             if has_signature(output):
                 raise ValueError('The saved PDF would still contain a signature.')
-            problems = [problem for problem in output.check_pdf_syntax()
-                        if not str(problem).startswith('WARNING')]
-            if problems:
-                raise ValueError('The saved PDF failed structural validation: ' + '; '.join(map(str, problems[:3])))
+            allowed = {str(item) for item in allowed_warnings}
+            warnings = [warning for warning in output.get_warnings()
+                        if str(warning) not in allowed]
+            if warnings:
+                raise ValueError('The saved PDF introduced structural warnings: ' +
+                                 '; '.join(map(str, warnings[:3])))
+            if deep:
+                problems = [problem for problem in output.check_pdf_syntax()
+                            if not str(problem).startswith('WARNING')]
+                if problems:
+                    raise ValueError('The saved PDF failed structural validation: ' + '; '.join(map(str, problems[:3])))
             if len(output.pages) != len(geometry):
                 raise ValueError('The saved PDF changed the page count.')
             for number, expected_geometry in enumerate(geometry):
@@ -584,7 +597,8 @@ def _same_file(first, second):
         return False
 
 
-def write_copy(source, destination, edits, stamp=None, original_source=None, verify=True):
+def write_copy(source, destination, edits, stamp=None, original_source=None,
+               verify='auto', balanced_pages=None):
     source, destination = Path(source), Path(destination)
     if _same_file(source, destination):
         raise ValueError('Choose a separate destination PDF.')
@@ -595,6 +609,22 @@ def write_copy(source, destination, edits, stamp=None, original_source=None, ver
     if stamp is not None and file_stamp(source) != stamp:
         raise ValueError('The source file has changed on disk.')
     edits = list(edits)
+    if verify is True:
+        mode = 'full'
+    elif verify in (False, None, 0):
+        mode = 'none'
+    elif verify == 'full':
+        mode = 'full'
+    elif verify == 'fast':
+        mode = 'fast'
+    else:
+        # Full QPDF tokenization is very expensive on huge CAD streams.  Small
+        # documents get the deep check by default; large ones still get page
+        # geometry, raw untouched-stream, PDFium text and QPDF warning checks.
+        try:
+            mode = 'full' if source.stat().st_size <= 2*1024**2 else 'fast'
+        except OSError:
+            mode = 'fast'
     fd, tmp = tempfile.mkstemp(suffix='.pdf', prefix='.vector-', dir=destination.parent)
     os.close(fd)
     try:
@@ -605,21 +635,27 @@ def write_copy(source, destination, edits, stamp=None, original_source=None, ver
                 if not 0 <= edit.page < len(pdf.pages):
                     raise ValueError('The edit refers to a page outside this PDF.')
                 by_page[edit.page].append(edit)
-            geometry = [_page_geometry(page) for page in pdf.pages]
-            untouched = {number: _raw_streams(page) for number, page in enumerate(pdf.pages)
-                         if number not in by_page}
+            geometry = [_page_geometry(page) for page in pdf.pages] if mode != 'none' else []
+            untouched = ({number: _raw_streams(page) for number, page in enumerate(pdf.pages)
+                          if number not in by_page} if mode != 'none' else {})
+            source_warnings = pdf.get_warnings() if mode != 'none' else []
             for number, changes in by_page.items():
-                rebuild(pdf, pdf.pages[number], changes)
+                # Absence from the set means "not checked yet", never "bad".
+                known = None
+                if balanced_pages is not None and number in balanced_pages:
+                    known = True
+                rebuild(pdf, pdf.pages[number], changes, balanced=known)
             pdf.save(tmp, normalize_content=False, compress_streams=False, recompress_flate=False,
                      stream_decode_level=q.StreamDecodeLevel.none, fix_metadata_version=False)
         if stamp is not None and file_stamp(source) != stamp:
             raise ValueError('The source file changed while saving.')
-        if verify:
+        if mode != 'none':
             expected = defaultdict(list)
             for edit in edits:
                 if edit.text and edit.text.strip():
                     expected[edit.page].append(edit.text)
-            _validate_output(tmp, geometry, untouched, expected)
+            _validate_output(tmp, geometry, untouched, expected,
+                             deep=mode == 'full', allowed_warnings=source_warnings)
         else:
             _check_output(tmp)
         if stamp is not None and file_stamp(source) != stamp:

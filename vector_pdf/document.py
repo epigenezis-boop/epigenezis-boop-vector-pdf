@@ -227,7 +227,15 @@ class LocalEditor:
             if 'original_source' in parameters:
                 options['original_source'] = source
             if 'verify' in parameters:
-                options['verify'] = True
+                # Deep QPDF tokenization is bounded on large CAD streams; the
+                # fast path still checks geometry, signatures, untouched bytes,
+                # PDFium text and QPDF warnings.
+                options['verify'] = 'auto'
+            if 'balanced_pages' in parameters:
+                options['balanced_pages'] = {
+                    number for number, index in document.indexes.items()
+                    if getattr(index, 'balanced', False)
+                }
             write_copy(basis, target, edits, **options)
         try:
             if target.parent.resolve() == Path(document.workspace.name).resolve():

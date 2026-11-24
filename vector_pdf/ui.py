@@ -962,7 +962,11 @@ class Workspace(QWidget):
                         'Text is available for inspection. Its structure restricts editing.'+detail)
         elif edit.original:
             notice = f'{edit.original.font.name} · перетащите рамку'
-            self.notice(notice, f'{edit.original.font.name} · drag the selection')
+            english = f'{edit.original.font.name} · drag the selection'
+            if 'clip' in str(getattr(edit.original, 'reason', '')).lower():
+                notice += ' · текст внутри clipping; перемещённая копия будет на верхнем слое'
+                english += ' · text is clipped; the moved copy will be placed on the top layer'
+            self.notice(notice, english)
         else:
             self.notice('Введите текст и перетащите его на нужное место.',
                         'Enter text and drag it into place.')

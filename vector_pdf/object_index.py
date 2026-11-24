@@ -94,11 +94,12 @@ class TextRun:
 
 
 class PageIndex:
-    def __init__(self, runs, objects, forms, elapsed):
+    def __init__(self, runs, objects, forms, elapsed, balanced=True):
         self.runs = tuple(runs)
         self.objects = objects
         self.forms = forms
         self.elapsed = elapsed
+        self.balanced = balanced
         self.tree = Index(((run.id, run.bounds, None) for run in runs)) if runs else Index()
 
     def area(self, bounds):
@@ -188,6 +189,7 @@ def index_page(path, number):
         explicit = False
         candidates = []
         tainted = False
+        unbalanced = False
         paint_epoch = 0
         objects = 0
         try:
@@ -204,6 +206,7 @@ def index_page(path, number):
                 # A single malformed stream must not erase text found elsewhere.
                 if inside:
                     tainted = True
+                unbalanced = True
                 inside, candidates = False, []
                 continue
             for args, operator in instructions:
@@ -213,7 +216,11 @@ def index_page(path, number):
                         stack.append(state)
                         tainted |= inside
                     elif op == 'Q':
-                        state = stack.pop() if stack else Graphics(unsafe=True)
+                        if stack:
+                            state = stack.pop()
+                        else:
+                            state = Graphics(unsafe=True)
+                            unbalanced = True
                         tainted |= inside
                     elif op == 'cm' and len(args) == 6:
                         values = tuple(float(value) for value in args)
@@ -233,6 +240,7 @@ def index_page(path, number):
                             marked.pop()
                         else:
                             state = replace(state, unsafe=True)
+                            unbalanced = True
                     elif op == 'BT':
                         matrix, explicit, inside, tainted = IDENTITY, False, True, inside
                         candidates = []
@@ -258,18 +266,22 @@ def index_page(path, number):
                         space = {'rg': '/DeviceRGB', 'g': '/DeviceGray', 'k': '/DeviceCMYK'}[op]
                         color = _color(args, space)
                         state = replace(state, fill=color, color_space=space,
-                                        unsafe_color=color is None or state.unsafe_color)
+                                        unsafe_color=color is None)
                     elif op in ('RG', 'G', 'K'):
                         pass
                     elif op in ('cs', 'CS'):
                         space = str(args[0]) if len(args) == 1 else ''
                         device = space in DEVICE_SPACES
+                        # A colour-space change resets the current colour to its
+                        # initial value.  Device spaces start at black; switching
+                        # between them must not make ordinary drawing text
+                        # uneditable.  Non-device/pattern spaces remain unknown.
                         state = replace(state, color_space=space, unsafe_color=not device,
-                                        fill=state.fill if device and space == state.color_space else None)
+                                        fill=(0., 0., 0.) if device else None)
                     elif op in ('sc', 'scn', 'SC', 'SCN'):
                         color = _color(args, state.color_space)
                         state = replace(state, fill=color if color is not None else state.fill,
-                                        unsafe_color=color is None or state.unsafe_color)
+                                        unsafe_color=color is None)
                     elif op in ('re',):
                         pass
                     elif op in ('W', 'W*'):
@@ -306,27 +318,31 @@ def index_page(path, number):
                         bounds = box(shape, (min(0, left)*state.size*horizontal, min(bottom, font.descender)*state.size,
                                              max(0.4*state.size, advance+(max(1, right)-1)*state.size*horizontal),
                                              max(top, font.ascender)*state.size))
-                        reasons = []
+                        blocking = []
+                        notes = []
                         if state.unsafe:
-                            reasons.append('unsupported graphics state')
+                            blocking.append('unsupported graphics state')
                         if state.clip:
-                            reasons.append('clipped text')
+                            # Editing is still safe: native replacements keep the
+                            # original clip, and moved/reformatted replacements are
+                            # appended to the page top layer outside this clip.
+                            notes.append('clipped text')
                         if state.unsafe_color or state.color_space not in DEVICE_SPACES:
-                            reasons.append('non-device color space')
+                            blocking.append('non-device color space')
                         if state.fill is None:
-                            reasons.append('unknown fill color')
+                            blocking.append('unknown fill color')
                         if state.mode != 0:
-                            reasons.append('text render mode')
+                            blocking.append('text render mode')
                         if not .05 <= horizontal <= 10:
-                            reasons.append('horizontal scaling')
+                            blocking.append('horizontal scaling')
                         if state.rise or state.spacing or state.word_space:
-                            reasons.append('text spacing')
+                            blocking.append('text spacing')
                         if similarity(state.ctm) is None or text_transform(shape) is None:
-                            reasons.append('unsupported transform')
+                            blocking.append('unsupported transform')
                         candidates.append(Glyph(stream_number, ordinal, text, data, state.font, matrix,
                                                 state.ctm, state.size, advance, horizontal, bounds, tuple(marked),
-                                                not reasons, state.fill, bool(state.clip), '; '.join(reasons),
-                                                paint_epoch))
+                                                not blocking, state.fill, bool(state.clip),
+                                                '; '.join(blocking+notes), paint_epoch))
                         explicit = False
                 except (ValueError, TypeError, OverflowError, ZeroDivisionError):
                     state = replace(state, unsafe=True)
@@ -348,12 +364,13 @@ def index_page(path, number):
         # longer matches reading order. Number stable visible runs by position.
         runs.sort(key=lambda run: (-run.placement[1], run.placement[0]))
         runs = [replace(run, id=number) for number, run in enumerate(runs)]
-        return PageIndex(runs, objects, forms, perf_counter()-start)
+        balanced = not unbalanced and not stack and not inside and not marked
+        return PageIndex(runs, objects, forms, perf_counter()-start, balanced)
 
 
 def append(runs, glyphs, fonts, spaces):
     if not ''.join(g.text for g in glyphs).strip():
         return
-    reason = next((g.reason for g in glyphs if g.reason), '') if not all(g.isolated for g in glyphs) else ''
+    reasons = sorted({reason for glyph in glyphs for reason in glyph.reason.split('; ') if reason})
     runs.append(TextRun(len(runs), tuple(glyphs), fonts[glyphs[0].font_key],
-                        union(g.bounds for g in glyphs), tuple(spaces), reason))
+                        union(g.bounds for g in glyphs), tuple(spaces), '; '.join(reasons)))

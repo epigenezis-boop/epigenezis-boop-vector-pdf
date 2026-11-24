@@ -149,13 +149,24 @@ def test_source_protection_and_atomic_failure(tmp_path):
         write_copy(path, path, [])
     signed = tmp_path / 'signed.pdf'
     with q.Pdf.open(path) as doc:
-        doc.Root.Perms = q.Dictionary()
+        signature = doc.make_indirect(q.Dictionary(
+            Type=q.Name.Sig, ByteRange=q.Array([0, 10, 20, 10]),
+            Contents=q.String(b'0'*64)))
+        doc.Root.Perms = q.Dictionary(DocMDP=signature)
         doc.save(signed)
     output = tmp_path / 'untouched.pdf'
     output.write_bytes(b'previous revision')
     with pytest.raises(ValueError, match='Signed'):
         write_copy(signed, output, [])
     assert output.read_bytes() == b'previous revision'
+    # An empty /Perms dictionary is not a signature; 0.3 must not false-positive.
+    empty = tmp_path / 'empty-perms.pdf'
+    with q.Pdf.open(path) as doc:
+        doc.Root.Perms = q.Dictionary()
+        doc.save(empty)
+    empty_copy = tmp_path / 'empty-perms-copy.pdf'
+    write_copy(empty, empty_copy, [])
+    assert empty_copy.is_file() and empty_copy.stat().st_size > 0
     protected = tmp_path / 'locked.pdf'
     with q.Pdf.open(path) as doc:
         doc.save(protected, encryption=q.Encryption(user='', owner='owner-password'))
