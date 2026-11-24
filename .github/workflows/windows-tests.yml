@@ -102,7 +102,7 @@ jobs:
               raise SystemExit('archive digest mismatch')
           print('manifest ok', len(manifest['files']))
           '@ | Set-Content -Encoding utf8 $verify
-          python $verify release/manifest.json smoke $file
+          python $verify release/manifest.json smoke "release/$file"
           if ($LASTEXITCODE) { throw 'Manifest verification failed.' }
           $env:QT_QPA_PLATFORM = 'offscreen'
           & 'smoke/Vector PDF/runtime/python.exe' -c "from PySide6.QtWidgets import QApplication; from vector_pdf.ui import MainWindow; app=QApplication([]); w=MainWindow(); w.show(); app.processEvents(); w.close()"
