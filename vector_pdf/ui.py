@@ -1422,12 +1422,15 @@ class Workspace(QWidget):
                 if answer != QMessageBox.StandardButton.Yes:
                     self._finish_after(after, False)
                     return False
-            if settings:
-                settings.setValue('last-directory', str(target.parent))
         except Exception as error:
             self.window.error(error)
             self._finish_after(after, False)
             return False
+        if settings:
+            try:
+                settings.setValue('last-directory', str(target.parent))
+            except Exception:
+                LOG.debug('Could not remember the last save directory', exc_info=True)
         state, draft = self.save_state()
         self.save_token += 1
         token = self.save_token
@@ -2420,8 +2423,8 @@ class MainWindow(QMainWindow):
             tab.save(after=done)
         except Exception as error:
             LOG.exception('Could not start saving a tab before quitting')
-            self.error(error)
             done(False)
+            self.error(error)
 
     def closeEvent(self, event):
         tabs = [self.tabs.widget(i) for i in range(self.tabs.count())]

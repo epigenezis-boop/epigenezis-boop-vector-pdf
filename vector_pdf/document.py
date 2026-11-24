@@ -104,8 +104,11 @@ class Document:
                         after = before
                     os.replace(temporary, target)
                     self.source_stamp = after
-                    self.snapshot_stamp = file_stamp(target)
                     self.basis_path = target
+                    try:
+                        self.snapshot_stamp = file_stamp(target)
+                    except OSError:
+                        self.snapshot_stamp = None
                     self.stamp = self.source_stamp
                     if before == after:
                         return target
