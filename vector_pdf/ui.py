@@ -1644,7 +1644,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setApplicationName('VECTOR PDF')
             app.setApplicationVersion(VERSION)
-        self.setWindowTitle('VECTOR PDF')
+        self.setWindowTitle('Vector')
         self.resize(1320, 820)
         self.setMinimumSize(780, 480)
         self.setAcceptDrops(True)
@@ -1683,7 +1683,7 @@ class MainWindow(QMainWindow):
         mark = QLabel()
         mark.setPixmap(self.windowIcon().pixmap(QSize(29, 29)))
         row.addWidget(mark)
-        brand = QLabel('VECTOR PDF', objectName='brand')
+        brand = QLabel('VECTOR', objectName='brand')
         row.addWidget(brand)
         row.addSpacing(13)
         for name, ru, en, slot, shortcuts in [
