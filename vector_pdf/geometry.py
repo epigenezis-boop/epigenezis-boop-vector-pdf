@@ -34,9 +34,9 @@ def union(boxes):
             max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
-def translate_angle(x, y, angle, scale=1.):
+def translate_angle(x, y, angle, scale=1., shear=0.):
     c, s = cos(radians(angle))*scale, sin(radians(angle))*scale
-    return c, s, -s, c, x, y
+    return c, s, c*shear-s, s*shear+c, x, y
 
 
 def similarity(matrix):
@@ -45,6 +45,20 @@ def similarity(matrix):
     if size < 1e-8 or abs(a-d) > 0.002*size or abs(b+c) > 0.002*size:
         return None
     return size, degrees(atan2(b, a))
+
+
+def text_transform(matrix):
+    """Decompose a uniformly sized text matrix with an optional baseline shear."""
+    a, b, c, d, _, _ = matrix
+    size = hypot(a, b)
+    if size < 1e-8:
+        return None
+    norm = size*size
+    shear = (a*c+b*d)/norm
+    height = (a*d-b*c)/norm
+    if abs(height-1.) > .002 or abs(shear) > .5:
+        return None
+    return size, degrees(atan2(b, a)), shear
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ import pikepdf as q
 from rtree.index import Index
 
 from .fonts import read_font
-from .geometry import IDENTITY, box, compose, point, similarity, union
+from .geometry import IDENTITY, box, compose, similarity, text_transform, union
 
 SHOW = {'Tj', 'TJ', "'", '"'}
 OPS = 'q Q cm gs BT ET Tf Tr Tm Tc Tw Tz Ts Td TD T* Tj TJ \' " Do BMC BDC EMC'
@@ -67,8 +67,14 @@ class TextRun:
     def placement(self):
         glyph = self.glyphs[0]
         matrix = compose(glyph.ctm, glyph.matrix)
-        scale, angle = similarity(matrix) or (1., 0.)
+        scale, angle, _ = text_transform(matrix) or (1., 0., 0.)
         return *matrix[-2:], glyph.size*scale, angle
+
+    @property
+    def shear(self):
+        glyph = self.glyphs[0]
+        shape = text_transform(compose(glyph.ctm, glyph.matrix))
+        return shape[2] if shape else 0.
 
     @property
     def editable(self):
@@ -207,7 +213,7 @@ def index_page(path, number):
                                          max(top, font.ascender)*state.size))
                     safe = (not state.unsafe and state.mode == 0 and .05 <= horizontal <= 10 and
                             state.rise == state.spacing == state.word_space == 0 and
-                            similarity(state.ctm) is not None and similarity(shape) is not None)
+                            similarity(state.ctm) is not None and text_transform(shape) is not None)
                     candidates.append(Glyph(stream_number, ordinal, text, data, state.font, matrix,
                                             state.ctm, state.size, advance, horizontal, bounds, tuple(marked), safe))
                     explicit = False

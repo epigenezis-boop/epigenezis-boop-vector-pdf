@@ -282,7 +282,10 @@ class Canvas(QWidget):
             painter.save()
             painter.translate(x, y)
             painter.rotate(self.sheet.rotation-edit.angle)
-            font = QFont('DejaVu Sans')
+            if (shear := edit.shear()):
+                painter.shear(-shear, 0.)
+            font = QFont('osifont' if edit.current_font() == 'ISO 3098' else 'DejaVu Sans')
+            font.setItalic(edit.native_italic())
             font.setPixelSize(max(1, round(edit.size)))
             painter.setFont(font)
             painter.setPen(QColor(10, 105, 218, 220))

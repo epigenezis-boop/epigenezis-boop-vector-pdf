@@ -1,6 +1,6 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from math import isfinite
+from math import isfinite, radians, tan
 import os
 from pathlib import Path
 import tempfile
@@ -11,6 +11,8 @@ import pikepdf as q
 from .fonts import FALLBACKS, fallback
 from .geometry import box, compose, inverse, translate_angle, union
 from .object_index import SHOW, streams
+
+ITALIC_SHEAR = tan(radians(12))
 
 
 @dataclass(frozen=True)
@@ -25,13 +27,15 @@ class Edit:
     color: tuple | None = None
     family: str = 'Original'
     original: object = None
+    italic: bool | None = None
 
     @classmethod
     def from_run(cls, page, run):
         return cls(page, run.id, run.text, *run.placement, original=run)
 
     def native_codes(self):
-        if not self.original or self.family != 'Original' or self.color is not None:
+        if (not self.original or self.family != 'Original' or self.color is not None or
+                abs(self.shear()-self.original.shear) > .001):
             return None
         if any(abs(a-b) > .001 for a, b in zip((self.x, self.y, self.size, self.angle), self.original.placement)):
             return None
@@ -56,6 +60,24 @@ class Edit:
             return 'Original'
         return 'ISO 3098' if self.original and 'gost' in self.original.font.name.lower() else 'Sans'
 
+    def native_italic(self):
+        return (self.current_font() == 'Original' and
+                bool(self.original.font.italic_angle))
+
+    def shear(self):
+        if self.italic is None and self.original:
+            if abs(self.original.shear) > .001:
+                return self.original.shear
+            if self.original.font.italic_angle and not self.native_italic():
+                return ITALIC_SHEAR
+        return ITALIC_SHEAR if self.italic and not self.native_italic() else 0.
+
+    def is_italic(self):
+        return self.native_italic() or abs(self.shear()) > .001
+
+    def matrix(self):
+        return translate_angle(self.x, self.y, self.angle, shear=self.shear())
+
     def bounds(self):
         if not self.text:
             return self.original.bounds if self.original else (self.x, self.y, self.x, self.y)
@@ -70,7 +92,7 @@ class Edit:
         else:
             font, data = fallback(family, self.text)
         horizontal = self.original.glyphs[0].horizontal if self.original else 1.
-        return text_bounds(font, data, self.size, translate_angle(self.x, self.y, self.angle), horizontal)
+        return text_bounds(font, data, self.size, self.matrix(), horizontal)
 
 
 def text_bounds(font, data, size, matrix, horizontal):
@@ -183,7 +205,7 @@ def rebuild(pdf, page, edits):
             family = edit.current_font()
             resource, data = bind_font(pdf, resource_fonts, family, edit)
             resources_changed = True
-            added.append(new_run(edit, resource, data, translate_angle(edit.x, edit.y, edit.angle), edit.size, True))
+            added.append(new_run(edit, resource, data, edit.matrix(), edit.size, True))
             continue
         glyphs = edit.original.glyphs
         codes = edit.native_codes()
@@ -193,7 +215,7 @@ def rebuild(pdf, page, edits):
             resource, data = bind_font(pdf, resource_fonts, family, edit)
             resources_changed |= family != 'Original'
             first = glyphs[0]
-            matrix = compose(inverse(first.ctm), translate_angle(edit.x, edit.y, edit.angle))
+            matrix = compose(inverse(first.ctm), edit.matrix())
             extra = new_run(edit, resource, data, matrix, edit.size, horizontal=first.horizontal)
         for i, glyph in enumerate(glyphs):
             code = codes[i] if codes is not None else b''

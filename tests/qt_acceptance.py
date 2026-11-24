@@ -6,7 +6,7 @@ from time import monotonic
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 from vector_pdf.object_index import index_page
 
 from vector_pdf.geometry import point
@@ -102,11 +102,23 @@ def run():
             assert abs(result.placement[0]-moved.x) < .001
             assert abs(result.placement[1]-moved.y) < .001
             window.theme('solar')
+            assert tab.text.font().family() == 'Exo 2'
+            assert window.findChild(QLabel, 'brand').font().family() == 'Russo One'
             # Restore the selected property card for the screenshot after the redo.
             tab.load_edit(next(iter(tab.document.edits.values())))
             wait_until(app, lambda: not tab.tile_job and not tab.tiles, 'render queue was not drained')
             if shot:
                 window.grab().save(str(Path(shot) / 'stamp-edit.png'))
+            tab.family.setCurrentIndex(tab.family.findData('ISO 3098'))
+            assert tab.italic.isEnabled()
+            tab.italic.setChecked(True)
+            assert tab.read_fields().shear() > .2
+            tab.family.showPopup()
+            wait_until(app, lambda: tab.family.view().isVisible(), 'font menu did not open')
+            assert tab.family.view().palette().base().color().name() == '#fffaf0'
+            if shot:
+                tab.family.view().grab().save(str(Path(shot) / 'solar-font-menu.png'))
+            tab.family.hidePopup()
             print('PASS: open, select, edit, drag on rotated view, undo/redo, solar theme, save and reopen')
             print(tab.document.metrics)
         finally:

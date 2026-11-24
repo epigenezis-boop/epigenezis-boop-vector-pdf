@@ -187,3 +187,29 @@ def test_words_on_a_line_form_one_edit_but_other_columns_stay_separate(tmp_path)
     edit = replace(Edit.from_run(0, runs[0]), text='Всю строку целиком', family='ISO 3098')
     write_copy(source, updated, [edit])
     assert [run.text for run in index_page(updated, 0).runs] == ['Всю строку целиком', 'Соседняя ячейка']
+
+
+def test_iso_italic_is_editable_after_save_and_independent_of_rotation(tmp_path):
+    source = drawing(tmp_path / 'source.pdf')
+    path = tmp_path / 'italic.pdf'
+    edit = Edit(0, -1, 'Наклон ISO 3098', 80, 260, 16, 30, family='ISO 3098', italic=True)
+    write_copy(source, path, [edit])
+
+    def inscription(file):
+        return next(run for run in index_page(file, 0).runs if run.text == edit.text)
+
+    run = inscription(path)
+    assert run.editable
+    assert run.placement == pytest.approx((80, 260, 16, 30))
+    assert run.shear == pytest.approx(edit.shear(), abs=1e-6)
+    assert run.shear > 0.2
+    assert Edit.from_run(0, run).is_italic()
+
+    straight = tmp_path / 'straight.pdf'
+    write_copy(path, straight, [replace(Edit.from_run(0, run), italic=False)])
+    reopened = inscription(straight)
+    assert reopened.placement == pytest.approx(run.placement)
+    assert abs(reopened.shear) < 1e-6
+    with q.Pdf.open(source) as before, q.Pdf.open(straight) as after:
+        assert after.check_pdf_syntax() == []
+        assert streams(before.pages[1])[0].read_raw_bytes() == streams(after.pages[1])[0].read_raw_bytes()

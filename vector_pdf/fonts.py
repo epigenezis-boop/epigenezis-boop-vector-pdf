@@ -98,6 +98,7 @@ class Font:
     embedded: bool
     descender: float = -0.25
     ascender: float = 0.9
+    italic_angle: float = 0.
 
     def decode(self, raw):
         if len(raw) % self.unit:
@@ -153,7 +154,8 @@ def read_font(obj):
     embedded = any(k in descriptor for k in ('/FontFile', '/FontFile2', '/FontFile3'))
     bounds = tuple(float(x)/1000 for x in descriptor.get('/FontBBox', [-150, -350, 1250, 1100]))
     return Font(name, mapping, widths, default, unit, bounds, embedded,
-                float(descriptor.get('/Descent', -250))/1000, float(descriptor.get('/Ascent', 900))/1000)
+                float(descriptor.get('/Descent', -250))/1000, float(descriptor.get('/Ascent', 900))/1000,
+                float(descriptor.get('/ItalicAngle', 0)))
 
 
 def fallback(family, text, pdf=None):
@@ -172,13 +174,14 @@ def fallback(family, text, pdf=None):
         cut.subset(font)
         chars = font.getBestCmap()
     head, hhea = font['head'], font['hhea']
+    italic_angle = font['post'].italicAngle if 'post' in font else 0.
     scale = 1000 / head.unitsPerEm
     glyphs = {c: font.getGlyphID(chars[ord(c)]).to_bytes(2, 'big') for c in set(text)}
     widths = {int.from_bytes(code, 'big'): round(font['hmtx'][chars[ord(c)]][0]*scale)
               for c, code in glyphs.items()}
     font_bounds = [round(x*scale) for x in (head.xMin, head.yMin, head.xMax, head.yMax)]
     measured = Font(family, {code: char for char, code in glyphs.items()}, widths, 0, 2,
-                    tuple(x/1000 for x in font_bounds), True, hhea.descent*scale/1000, hhea.ascent*scale/1000)
+                    tuple(x/1000 for x in font_bounds), True, hhea.descent*scale/1000, hhea.ascent*scale/1000, italic_angle)
     encoded = b''.join(glyphs[c] for c in text)
     if pdf is None:
         font.close()
@@ -191,8 +194,8 @@ def fallback(family, text, pdf=None):
     prefix = ''.join(chr(65+x%26) for x in mark)
     n = q.Name('/'+prefix+'+'+real_name)
     descriptor = pdf.make_indirect(q.Dictionary(
-        Type=q.Name.FontDescriptor, FontName=n, Flags=32, FontBBox=q.Array(font_bounds),
-        ItalicAngle=0, Ascent=round(measured.ascender*1000), Descent=round(measured.descender*1000),
+        Type=q.Name.FontDescriptor, FontName=n, Flags=96 if italic_angle else 32, FontBBox=q.Array(font_bounds),
+        ItalicAngle=float(italic_angle), Ascent=round(measured.ascender*1000), Descent=round(measured.descender*1000),
         CapHeight=round(measured.ascender*1000), StemV=80, FontFile2=font_file))
     entries = q.Array()
     for gid in sorted(widths):

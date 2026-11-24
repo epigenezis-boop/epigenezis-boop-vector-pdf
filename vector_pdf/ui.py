@@ -8,9 +8,9 @@ from threading import Thread
 from weakref import ref
 
 from PySide6.QtCore import QObject, QPointF, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QSplitter, QTabWidget, QToolButton, QVBoxLayout, QWidget,
     QColorDialog,
@@ -163,6 +163,9 @@ class Workspace(QWidget):
         self.family.currentIndexChanged.connect(self.preview)
         self.size = self.spin(.25, 4000, ' pt')
         self.angle = self.spin(-360, 360, '°')
+        self.italic = QCheckBox()
+        self.lang.bind(self.italic.setText, 'Наклонный шрифт', 'Italic')
+        self.italic.toggled.connect(self.preview)
         self.color = QPushButton()
         self.color.clicked.connect(self.choose_color)
         for widget, ru, en in [(self.text, 'Текст', 'Text'), (self.family, 'Шрифт', 'Font'),
@@ -172,6 +175,7 @@ class Workspace(QWidget):
             self.lang.bind(label.setText, ru, en)
             label.setBuddy(widget)
             fields.addRow(label, widget)
+        fields.addRow(self.italic)
         self.font_notice = QLabel()
         self.font_notice.setWordWrap(True)
         self.font_notice.setObjectName('panelNote')
@@ -484,13 +488,14 @@ class Workspace(QWidget):
         self.view.preview = None
         self.view.update()
         self.edit_color = edit.color
-        temporary = [self.text, self.family, self.size, self.angle]
+        temporary = [self.text, self.family, self.size, self.angle, self.italic]
         for widget in temporary:
             widget.blockSignals(True)
         self.text.setText(edit.text)
         self.family.setCurrentIndex(self.family.findData(edit.family))
         self.size.setValue(edit.size)
         self.angle.setValue(edit.angle)
+        self.italic.setChecked(edit.is_italic())
         for widget in temporary:
             widget.blockSignals(False)
         editable = not edit.original or edit.original.editable
@@ -513,6 +518,11 @@ class Workspace(QWidget):
     def font_label(self, edit):
         warning = edit.text and edit.family == 'Original' and edit.current_font() != 'Original'
         family = edit.current_font()
+        self.italic.setEnabled(not edit.native_italic())
+        if edit.native_italic() and not self.italic.isChecked():
+            blocked = self.italic.blockSignals(True)
+            self.italic.setChecked(True)
+            self.italic.blockSignals(blocked)
         self.font_notice.setText(self.lang.get(f'Для этих символов встраивается {family}.',
             f'{family} will be embedded for these characters.') if warning else '')
 
@@ -524,10 +534,13 @@ class Workspace(QWidget):
         def entered(control, previous):
             return previous if abs(control.value()-previous) < .0005 else control.value()
         x, y = self.position_draft
-        return replace(self.selected, text=self.text.text(), x=x, y=y,
+        edit = replace(self.selected, text=self.text.text(), x=x, y=y,
                        size=entered(self.size, self.selected.size),
                        angle=entered(self.angle, self.selected.angle), color=self.edit_color,
                        family=self.family.currentData())
+        if not edit.native_italic() and self.italic.isChecked() != edit.is_italic():
+            edit = replace(edit, italic=self.italic.isChecked())
+        return edit
 
     def choose_color(self):
         initial = QColor.fromRgbF(*self.edit_color) if self.edit_color else QColor('black')
@@ -1033,7 +1046,15 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
     def apply_theme(self):
-        self.surface = THEMES[self.appearance][-1]
+        base, panel, raised, _, text, muted, select, self.surface = THEMES[self.appearance]
+        palette = self.palette()
+        roles = QPalette.ColorRole
+        for role, color in ((roles.Window, panel), (roles.Base, raised), (roles.AlternateBase, base),
+                            (roles.Button, raised), (roles.Text, text), (roles.WindowText, text),
+                            (roles.ButtonText, text), (roles.Highlight, select),
+                            (roles.HighlightedText, text), (roles.PlaceholderText, muted)):
+            palette.setColor(role, QColor(color))
+        self.setPalette(palette)
         self.setStyleSheet(stylesheet(self.appearance))
         self.empty.setStyleSheet('background: '+self.surface)
         for i in range(self.tabs.count()):
@@ -1216,10 +1237,11 @@ class MainWindow(QMainWindow):
 
 
 def configure_fonts(app):
-    for filename in ('RussoOne-Regular.ttf', 'Exo2-Variable.ttf'):
+    for filename in ('RussoOne-Regular.ttf', 'Exo2-Variable.ttf', 'osifont.ttf'):
         QFontDatabase.addApplicationFont(str(ASSETS / filename))
     ui_font = QFont()
-    ui_font.setFamilies(['Russo One', 'Exo 2'])
+    ui_font.setFamily('Exo 2')
+    ui_font.setWeight(QFont.Weight.Normal)
     ui_font.setPointSize(10)
     app.setFont(ui_font)
 
