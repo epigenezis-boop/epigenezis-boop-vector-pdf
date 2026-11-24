@@ -2,7 +2,9 @@ name: Windows release
 on:
   push:
     branches: [main]
-    paths: [vector_pdf/version.py, .github/workflows/windows-release.yml]
+    paths:
+      - vector_pdf/version.py
+      - .github/workflows/windows-release.yml
   workflow_dispatch:
 
 permissions:
@@ -11,6 +13,9 @@ permissions:
 concurrency:
   group: vector-pdf-windows-release
   cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
 
 jobs:
   bundle:
@@ -24,51 +29,127 @@ jobs:
       - name: Test editor and updater
         run: |
           python -m pip install -r requirements-test.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python -m pytest -q
-      - name: Build portable package
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build portable package and canonical manifest
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $version = python -c "from vector_pdf.version import VERSION; print(VERSION)"
+          if ($LASTEXITCODE) { throw 'Could not read the application version.' }
+          if ([version]$version -lt [version]'0.3.0') { throw "Refusing to publish a pre-hardening version: $version" }
           "VECTOR_VERSION=$version" >> $env:GITHUB_ENV
-          mkdir release, wheels
-          python -m pip download --platform win_amd64 --implementation cp --python-version 3.12 --abi cp312 --only-binary=:all: -r requirements.txt -d wheels
+          New-Item -ItemType Directory -Force release, wheels | Out-Null
+          python -m pip download --platform win_amd64 --implementation cp --python-version 3.12 --only-binary=:all: -r requirements.txt -d wheels
+          if ($LASTEXITCODE) { throw 'Dependency download failed.' }
           curl.exe --fail --location --output python-embed.zip https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip
+          if ($LASTEXITCODE) { throw 'Python embeddable download failed.' }
           $vswhere = Join-Path "${env:ProgramFiles(x86)}" 'Microsoft Visual Studio\Installer\vswhere.exe'
           $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           $dev = Join-Path $install 'Common7\Tools\VsDevCmd.bat'
           @"
           @call "$dev" -arch=x64 -host_arch=x64
           @if errorlevel 1 exit /b 1
-          @cl /nologo /GS- /O2 /c tools\launcher_windows.c
+          @cl /nologo /GS /O2 /W3 /c tools\launcher_windows.c
           @if errorlevel 1 exit /b 1
           @rc /nologo /fo launcher_windows.res tools\launcher_windows.rc
           @if errorlevel 1 exit /b 1
-          @link /nologo /subsystem:windows /entry:start /nodefaultlib /out:VectorPDF.exe launcher_windows.obj launcher_windows.res kernel32.lib user32.lib shell32.lib
+          @link /nologo /subsystem:windows /entry:start /nodefaultlib /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /MANIFEST /out:VectorPDF.exe launcher_windows.obj launcher_windows.res kernel32.lib user32.lib shell32.lib
+          @if errorlevel 1 exit /b 1
+          @mt.exe -nologo "-inputresource:VectorPDF.exe;#1" -out:launcher-extracted.manifest
+          @if errorlevel 1 exit /b 1
+          @findstr /c:"longPathAware" launcher-extracted.manifest >nul
+          @if errorlevel 1 exit /b 1
           "@ | Set-Content -Encoding Ascii build-launcher.cmd
           cmd.exe /c build-launcher.cmd
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE) { throw 'Launcher build failed.' }
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path VectorPDF.exe))
+          if ($info.FileVersion -ne '0.3.0.0') { throw "Unexpected launcher FileVersion: $($info.FileVersion)" }
+          if ($info.ProductVersion -ne '0.3.0.0') { throw "Unexpected launcher ProductVersion: $($info.ProductVersion)" }
+          if ($info.ProductName -ne 'VECTOR PDF') { throw "Unexpected ProductName: $($info.ProductName)" }
+          python tools/sbom.py --output release/sbom.json
+          if ($LASTEXITCODE) { throw 'SBOM generation failed.' }
           $file = "VECTOR-PDF-$version-win-x64.zip"
-          python tools/package_windows.py python-embed.zip wheels VectorPDF.exe "release/$file"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/package_windows.py python-embed.zip wheels VectorPDF.exe "release/$file" --manifest release/manifest.json --sbom release/sbom.json
+          if ($LASTEXITCODE) { throw 'Packaging failed.' }
           $hash = (Get-FileHash "release/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $file" | Set-Content -Encoding Ascii "release/$file.sha256"
+      - name: Smoke-test extracted bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = "VECTOR-PDF-$env:VECTOR_VERSION-win-x64.zip"
           Expand-Archive "release/$file" -DestinationPath smoke
+          $verify = Join-Path $env:RUNNER_TEMP 'verify-manifest.py'
+          @'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          manifest_path, bundle, archive = map(pathlib.Path, sys.argv[1:4])
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          root = bundle / 'Vector PDF'
+          for entry in manifest['files']:
+              path = root / entry['path']
+              data = path.read_bytes()
+              if len(data) != entry['size']:
+                  raise SystemExit(f"size mismatch: {entry['path']}")
+              if hashlib.sha256(data).hexdigest() != entry['sha256']:
+                  raise SystemExit(f"hash mismatch: {entry['path']}")
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if digest != manifest['archive_sha256']:
+              raise SystemExit('archive digest mismatch')
+          print('manifest ok', len(manifest['files']))
+          '@ | Set-Content -Encoding utf8 $verify
+          python $verify release/manifest.json smoke $file
+          if ($LASTEXITCODE) { throw 'Manifest verification failed.' }
+          $env:QT_QPA_PLATFORM = 'offscreen'
           & 'smoke/Vector PDF/runtime/python.exe' -c "from PySide6.QtWidgets import QApplication; from vector_pdf.ui import MainWindow; app=QApplication([]); w=MainWindow(); w.show(); app.processEvents(); w.close()"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Publish complete stable release
+          if ($LASTEXITCODE) { throw 'Packaged application smoke test failed.' }
+      - name: Sign the canonical manifest (fail closed without a key)
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:UPDATE_SIGNING_KEY) {
+            throw 'UPDATE_SIGNING_KEY is not configured. Refusing to publish an unsigned update.'
+          }
+          $key = Join-Path $env:RUNNER_TEMP 'vector-update-signing.key'
+          try {
+            [System.IO.File]::WriteAllText($key, $env:UPDATE_SIGNING_KEY, [System.Text.Encoding]::ASCII)
+            python tools/sign_manifest.py release/manifest.json --key $key --output release/manifest.json.sig
+            if ($LASTEXITCODE) { throw 'Manifest signing failed.' }
+          }
+          finally {
+            Remove-Item -Force $key -ErrorAction SilentlyContinue
+          }
+          python tools/sign_manifest.py release/manifest.json --verify --signature release/manifest.json.sig
+          if ($LASTEXITCODE) { throw 'Manifest signature verification failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vector-pdf-release
+          path: release/*
+      - name: Publish complete signed release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $tag = "v$env:VECTOR_VERSION"
           $file = "VECTOR-PDF-$env:VECTOR_VERSION-win-x64.zip"
+          foreach ($asset in @($file, "$file.sha256", 'manifest.json', 'manifest.json.sig', 'sbom.json')) {
+            if (-not (Test-Path "release/$asset" -PathType Leaf)) { throw "Missing release asset: $asset" }
+          }
           $draft = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft 2>$null
           if ($LASTEXITCODE -eq 0 -and $draft -eq 'false') { exit 0 }
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --draft --title "VECTOR PDF $env:VECTOR_VERSION" --generate-notes
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if ($LASTEXITCODE) { throw 'Draft release creation failed.' }
           }
-          gh release upload $tag "release/$file" "release/$file.sha256" --repo $env:GITHUB_REPOSITORY --clobber
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release upload $tag "release/$file" "release/$file.sha256" "release/manifest.json" "release/manifest.json.sig" "release/sbom.json" --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE) { throw 'Release upload failed.' }
           gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE) { throw 'Release publication failed.' }
