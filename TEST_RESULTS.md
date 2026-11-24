@@ -93,10 +93,12 @@ UI-прогон на том же файле (offscreen Qt):
 
 ## Portable Windows x64
 
-Собран `VECTOR-PDF-0.3.0-win-x64.zip` (63,8 МБ, 3141 файл в manifest).
-Локально использован bootstrap `VectorPDF.exe` 0.2.1 с добавленными через
-`rcedit` VERSIONINFO 0.3.0.0 и PE-манифестом; исходник нового лаунчера и CI
-сборка находятся в `tools/` и `.github/`.
+Собран `VECTOR-PDF-0.3.0-win-x64.zip` (63,8 МБ, 3145 файлов в manifest).
+SHA-256 архива публикуется в `VECTOR-PDF-0.3.0-win-x64.zip.sha256` рядом с
+релизом, а не внутри него (иначе хэш был бы самоссылочным). Локально
+использован bootstrap `VectorPDF.exe` 0.2.1 с добавленными через `rcedit`
+VERSIONINFO 0.3.0.0 и PE-манифестом; исходник нового лаунчера и CI сборка
+находятся в `tools/` и `.github/`.
 
 Проверено:
 
@@ -104,6 +106,9 @@ UI-прогон на том же файле (offscreen Qt):
 - `runtime\python.exe` с offscreen Qt импортирует `vector_pdf.ui` и создаёт
   `MainWindow`; `VERSION 0.3.0`;
 - `VectorPDF.exe` запускает `pythonw.exe`, окно с заголовком `VECTOR PDF`;
+- packaged runtime открыл реальный чертёж, заменил «Размеры» → «Тест»,
+  сохранил копию; QPDF syntax пуст, PDFium 9 страниц, новый текст есть,
+  старый отсутствует;
 - `Get-AuthenticodeSignature` — **NotSigned** (сертификата нет);
 - реальный `VectorPDF.exe` 0.2.1 bootstrap не содержит нового поведения
   лаунчера; компиляция нового C-лаунчера **NOT RUN** (MSVC отсутствует).
