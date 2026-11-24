@@ -1,8 +1,9 @@
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from time import perf_counter
+from weakref import WeakSet
 
 import pypdfium2 as pdfium
 from pypdfium2 import raw
@@ -10,6 +11,7 @@ from pypdfium2 import raw
 from .geometry import Sheet
 
 TILE = 512
+FALLBACK_WIDTH, FALLBACK_HEIGHT = 612., 792.
 
 
 @dataclass(frozen=True)
@@ -30,13 +32,27 @@ def overlap(a, b):
 
 
 class TileCache:
+    """Per-tab LRU tile cache with a soft budget shared by all tabs.
+
+    Each cache enforces its own budget first.  A class-wide ceiling then trims the
+    largest cache (oldest tiles first) so several documents cannot grow without
+    bound.  The inactive-cache trim in the UI additionally keeps background tabs
+    small.  ``peek`` is for existence checks and never changes hit/miss statistics.
+    """
+    MAX_TOTAL = 256*1024**2
+    _instances = WeakSet()
+
     def __init__(self, budget=128*1024**2):
         self._data = OrderedDict()
         self.bytes = self.hits = self.misses = 0
         self.budget = budget
+        TileCache._instances.add(self)
 
     def __contains__(self, key):
         return key in self._data
+
+    def peek(self, key):
+        return self._data.get(key)
 
     def get(self, key):
         value = self._data.get(key)
@@ -55,7 +71,22 @@ class TileCache:
             self._remove(key)
         self._data[key] = image
         self.bytes += image.sizeInBytes()
-        while self.bytes > self.budget:
+        while self.bytes > self.budget and self._data:
+            self._remove(next(iter(self._data)))
+        TileCache._enforce_total()
+
+    @classmethod
+    def _enforce_total(cls):
+        while True:
+            caches = [cache for cache in list(cls._instances) if cache._data]
+            total = sum(cache.bytes for cache in caches)
+            if total <= cls.MAX_TOTAL or not caches:
+                return
+            victim = max(caches, key=lambda cache: cache.bytes)
+            victim._remove(next(iter(victim._data)))
+
+    def trim(self, budget):
+        while self.bytes > budget and self._data:
             self._remove(next(iter(self._data)))
 
     def _remove(self, key):
@@ -69,6 +100,27 @@ class TileCache:
         return len(keys)
 
 
+def valid_sheet(sheet):
+    return (sheet is not None and isfinite(sheet.width) and isfinite(sheet.height)
+            and sheet.width > 0 and sheet.height > 0)
+
+
+def normalized_sheet(sheet):
+    """Replace non-finite or degenerate page geometry with a safe fallback."""
+    if not valid_sheet(sheet):
+        return Sheet(FALLBACK_WIDTH, FALLBACK_HEIGHT,
+                     (0, 0, FALLBACK_WIDTH, FALLBACK_HEIGHT), 0)
+    try:
+        crop = tuple(float(value) for value in sheet.crop)
+        if (len(crop) != 4 or not all(isfinite(value) for value in crop)
+                or crop[2] <= crop[0] or crop[3] <= crop[1]):
+            crop = (0, 0, sheet.width, sheet.height)
+    except (TypeError, ValueError):
+        crop = (0, 0, sheet.width, sheet.height)
+    rotation = sheet.rotation if sheet.rotation in (0, 90, 180, 270) else 0
+    return Sheet(float(sheet.width), float(sheet.height), crop, rotation)
+
+
 class RenderEngine:
     """All PDFium calls, including destruction, stay on the same worker."""
     def __init__(self):
@@ -80,17 +132,26 @@ class RenderEngine:
         start = perf_counter()
         document = pdfium.PdfDocument(path)
         try:
-            sheets = []
-            for i in range(len(document)):
-                if i == 0:
-                    page = document[i]
-                    sheets.append(self._sheet(page))
-                    page.close()
-                else:
-                    width, height = document.get_page_size(i)
-                    sheets.append(Sheet(width, height, (0, 0, width, height), 0))
-            if not sheets:
+            count = len(document)
+            if not count:
                 raise ValueError('The PDF contains no pages.')
+            sheets = []
+            for i in range(count):
+                try:
+                    if i == 0:
+                        page = document[i]
+                        try:
+                            sheet = self._sheet(page)
+                        finally:
+                            page.close()
+                    else:
+                        width, height = document.get_page_size(i)
+                        sheet = Sheet(width, height, (0, 0, width, height), 0)
+                except Exception:
+                    # One damaged page must not make the whole document unusable.
+                    sheet = Sheet(FALLBACK_WIDTH, FALLBACK_HEIGHT,
+                                  (0, 0, FALLBACK_WIDTH, FALLBACK_HEIGHT), 0)
+                sheets.append(normalized_sheet(sheet))
         except Exception:
             document.close()
             raise
@@ -99,6 +160,7 @@ class RenderEngine:
         return sheets, (perf_counter()-start)*1000
 
     def attach(self, key, path):
+        self.close(key)
         self.documents[key] = pdfium.PdfDocument(path)
 
     @staticmethod
@@ -106,7 +168,7 @@ class RenderEngine:
         return Sheet(*page.get_size(), tuple(page.get_bbox()), page.get_rotation())
 
     def sheet(self, key, number):
-        return self._sheet(self._page(key, number))
+        return normalized_sheet(self._sheet(self._page(key, number)))
 
     def close(self, key):
         for pair in list(self.pages):
