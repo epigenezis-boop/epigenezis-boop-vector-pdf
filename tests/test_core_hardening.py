@@ -1,15 +1,17 @@
 from dataclasses import replace
+import os
 from pathlib import Path
 
 import pikepdf as q
 import pytest
 
+from vector_pdf import fonts as font_module
 from vector_pdf import writer
-from vector_pdf.fonts import MAX_CMAP_BYTES, cmap, fallback
+from vector_pdf.fonts import ASSETS, MAX_CMAP_BYTES, cmap, fallback
 from vector_pdf.geometry import translate_angle
 from vector_pdf.object_index import index_page, streams
 from vector_pdf.writer import (Edit, has_signature, new_run, signature_state, validate,
-                               write_copy)
+                               validate_edit, write_copy)
 from fixtures_core import (char_boxes, cmap_stream, fallback_pdf, ink, minimal_pdf,
                            page_text, simple_font)
 
@@ -136,7 +138,7 @@ def test_signature_dictionaries_are_detected(tmp_path, kind):
         with pytest.raises(ValueError, match='Signed'):
             validate(pdf)
     destination = tmp_path/f'{kind}-out.pdf'
-    with pytest.raises(ValueError, match='Signed'):
+    with pytest.raises(ValueError, match='(?i)signature'):
         write_copy(source, destination, [])
     assert not destination.exists()
 
@@ -358,6 +360,65 @@ def test_bounds_fall_back_safely_for_unsupported_glyph(tmp_path):
     edit = replace(Edit.from_run(0, run), text='\U00010348')
     assert not edit.glyph_supported()
     assert all(isfinite(value) for value in edit.bounds())
+
+
+def sized_text_pdf(path, text, size, page_size):
+    with q.Pdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=page_size)
+        font, metrics, _ = fallback('Sans', text, pdf)
+        page.Resources = q.Dictionary(Font=q.Dictionary(F0=font))
+        page.Contents = pdf.make_stream(new_run(
+            Edit(0, -1, text, 10, 100, size, 0), '/F0', metrics.encode(text),
+            translate_angle(10, 100, 0), size))
+        pdf.save(path)
+    return Path(path)
+
+
+def test_validate_edit_preserves_long_original_text(tmp_path):
+    text = 'A'*2000
+    source = sized_text_pdf(tmp_path/'long.pdf', text, 4, (6500, 200))
+    run = run_named(source, text)
+    edit = Edit.from_run(0, run)
+    validate_edit(edit)
+    destination = tmp_path/'long-out.pdf'
+    write_copy(source, destination, [edit])
+    assert len(run_named(destination, text).text) == 2000
+
+
+@pytest.mark.parametrize('size,page_size', [(.1, (300, 200)), (4500, (7000, 6000))])
+def test_validate_edit_accepts_original_extreme_sizes(tmp_path, size, page_size):
+    source = sized_text_pdf(tmp_path/f'size-{size}.pdf', 'AB', size, page_size)
+    run = run_named(source, 'AB')
+    edit = Edit.from_run(0, run)
+    assert edit.size == pytest.approx(size)
+    validate_edit(edit)
+    destination = tmp_path/f'size-{size}-out.pdf'
+    write_copy(source, destination, [edit])
+    assert run_named(destination, 'AB').text == 'AB'
+
+
+def test_learn_fonts_skips_broken_local_font(tmp_path, monkeypatch):
+    (tmp_path/'broken.ttf').write_bytes(b'not a font')
+    (tmp_path/'good.ttf').write_bytes((ASSETS/'DejaVuSans.ttf').read_bytes())
+    monkeypatch.setattr(font_module, 'font_directory', lambda: tmp_path)
+    monkeypatch.setattr(font_module, 'FALLBACKS', dict(font_module.FALLBACKS))
+    font_module.learn_fonts()
+    local = {key for key in font_module.FALLBACKS if key.startswith('Local · ')}
+    assert local == {'Local · good'}
+    assert font_module.FALLBACKS['Local · good'] == tmp_path/'good.ttf'
+
+    broken = tmp_path/'broken.ttf'
+    font_module.FALLBACKS['Local · broken'] = broken
+    measured, data = font_module.fallback('Local · broken', 'AB')
+    assert measured.name == 'Sans'
+    assert data == measured.encode('AB')
+    assert 'Local · broken' not in font_module.FALLBACKS
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='LOCALAPPDATA is Windows-specific.')
+def test_font_directory_falls_back_without_localappdata(monkeypatch):
+    monkeypatch.delenv('LOCALAPPDATA', raising=False)
+    assert font_module.font_directory() == Path.home()/'.vector-pdf'/'fonts'
 
 
 def test_noop_edit_keeps_streams_and_font(tmp_path):

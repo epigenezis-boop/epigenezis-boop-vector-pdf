@@ -225,7 +225,9 @@ def _walk_signatures(obj, seen):
     marker = generation if generation != (0, 0) else ('direct', id(obj))
     if marker in seen:
         return False, False
-    seen.add(marker)
+    # Keep direct objects alive: their Python id can otherwise be reused and a
+    # later object would be skipped as already visited.
+    seen[marker] = obj
     if isinstance(obj, q.Array):
         signed = empty = False
         for value in obj:
@@ -289,7 +291,7 @@ def _walk_signatures(obj, seen):
 
 def signature_state(pdf):
     try:
-        signed, empty = _walk_signatures(pdf.Root, set())
+        signed, empty = _walk_signatures(pdf.Root, {})
     except Exception:
         return 'signed'
     if signed:
@@ -311,9 +313,13 @@ def validate(pdf):
 def validate_edit(edit):
     if edit.original and not edit.original.editable:
         raise ValueError('This text object is read-only.')
-    if (len(edit.text) > 1500 or any(not c.isprintable() for c in edit.text)
-            or not .25 <= edit.size <= 4000 or not all(isfinite(x) for x in (edit.x, edit.y, edit.angle))):
-        raise ValueError('Use a single printable line of at most 1500 characters and a valid size.')
+    unchanged_text = edit.original is not None and edit.text == edit.original.text
+    unchanged_size = edit.original is not None and abs(edit.size-edit.original.placement[2]) < .0005
+    too_long = len(edit.text) > 100_000 and not unchanged_text
+    bad_size = not 0 < edit.size <= 5000 and not unchanged_size
+    if (too_long or any(not c.isprintable() for c in edit.text) or bad_size or
+            not all(isfinite(x) for x in (edit.x, edit.y, edit.angle))):
+        raise ValueError('Use a single printable line of at most 100000 characters and a size from 0 to 5000 points.')
     if edit.color is not None and (len(edit.color) != 3 or any(not 0 <= v <= 1 for v in edit.color)):
         raise ValueError('Invalid color.')
     if edit.family not in {*FALLBACKS, 'Original'}:

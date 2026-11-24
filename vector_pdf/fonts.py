@@ -18,25 +18,54 @@ FALLBACKS = {
     'Serif': 'DejaVuSerif.ttf',
     'Mono': 'DejaVuSansMono.ttf',
 }
+BUILTIN_FONTS = frozenset(FALLBACKS)
+
 
 def font_directory():
     if os.name == 'nt':
-        return Path(os.environ['LOCALAPPDATA']) / 'VectorPDF' / 'fonts'
-    return Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share')) / 'vector-pdf' / 'fonts'
+        base = os.environ.get('LOCALAPPDATA')
+        if base:
+            return Path(base) / 'VectorPDF' / 'fonts'
+        return Path.home() / '.vector-pdf' / 'fonts'
+    base = os.environ.get('XDG_DATA_HOME')
+    return (Path(base) if base else Path.home() / '.local' / 'share') / 'vector-pdf' / 'fonts'
+
+
+def _local_font_ok(path):
+    try:
+        if path.stat().st_size > 25*1024**2:
+            return False
+        with TTFont(path, lazy=False) as font:
+            if not any(table in font for table in ('glyf', 'CFF ', 'CFF2')) or not font.getBestCmap():
+                return False
+            flags = font['OS/2'].fsType if 'OS/2' in font else 0
+            if flags & (0x0002 | 0x0100 | 0x0200) or (flags & 0x0004 and not flags & 0x0008):
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def learn_fonts():
-    for path in sorted(font_directory().glob('*.ttf')):
-        FALLBACKS['Local · '+path.stem] = path
+    for key in [name for name in FALLBACKS if name.startswith('Local · ')]:
+        FALLBACKS.pop(key, None)
+    try:
+        paths = sorted(font_directory().glob('*.ttf'))
+    except Exception:
+        return
+    for path in paths:
+        if _local_font_ok(path):
+            FALLBACKS['Local · '+path.stem] = path
 
 
 def import_font(path):
     path = Path(path)
     if path.suffix.lower() != '.ttf' or path.stat().st_size > 25*1024**2:
         raise ValueError('Choose a TrueType .ttf file no larger than 25 MiB.')
-    with TTFont(path) as font:
-        if 'glyf' not in font or not font.getBestCmap():
-            raise ValueError('The file needs TrueType outlines and a Unicode character map.')
+    with TTFont(path, lazy=False) as font:
+        if (not any(table in font for table in ('glyf', 'CFF ', 'CFF2'))
+                or not font.getBestCmap()):
+            raise ValueError('The file needs outline data and a Unicode character map.')
         flags = font['OS/2'].fsType if 'OS/2' in font else 0
         if flags & (0x0002 | 0x0100 | 0x0200) or (flags & 0x0004 and not flags & 0x0008):
             raise ValueError('This font’s embedding permissions prohibit editable subsets.')
@@ -432,7 +461,7 @@ def read_font(obj):
     return font
 
 
-def fallback(family, text, pdf=None):
+def _fallback(family, text, pdf=None):
     font = TTFont(ASSETS / FALLBACKS[family], recalcTimestamp=False)
     real_name = font['name'].getDebugName(6) or 'VectorPDF'
     real_name = re.sub('[^a-zA-Z0-9-]', '', real_name) or 'VectorPDF'
@@ -494,3 +523,13 @@ def fallback(family, text, pdf=None):
         Encoding=q.Name('/Identity-H'),
         DescendantFonts=q.Array([descendant]), ToUnicode=unicode_map))
     return resource, measured, encoded
+
+
+def fallback(family, text, pdf=None):
+    try:
+        return _fallback(family, text, pdf)
+    except Exception:
+        if family in BUILTIN_FONTS:
+            raise
+        FALLBACKS.pop(family, None)
+        return _fallback('Sans', text, pdf=pdf)
