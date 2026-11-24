@@ -278,7 +278,10 @@ class Bridge(QObject):
         except Exception:
             # A Python exception in a Qt slot must never escape into Qt.  Log it and
             # let the workspace's own try/finally protect busy flags.
-            LOG.exception('Unhandled exception in an asynchronous UI callback')
+            try:
+                LOG.exception('Unhandled exception in an asynchronous UI callback')
+            except Exception:
+                pass
 
 
 class Workspace(QWidget):
