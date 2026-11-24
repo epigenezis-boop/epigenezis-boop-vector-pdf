@@ -79,21 +79,17 @@ def test_inventor_acceptance(tmp_path):
         assert len(before.pages) == len(after.pages) == 9
         assert after.check_pdf_syntax() == []
         assert fingerprint(before.Root.OCProperties) == fingerprint(after.Root.OCProperties)
-        changed = []
         for i, (a, b) in enumerate(zip(before.pages, after.pages)):
             assert fingerprint(a.MediaBox) == fingerprint(b.MediaBox)
             assert fingerprint(a.Resources) == fingerprint(b.Resources)
+            if i == 0:
+                # The 0.3 policy clears the selected Tj and appends one isolated
+                # top-layer run, so the edited page may gain wrapper streams.
+                # Raster comparison below verifies that no other pixels moved.
+                continue
             sa, sb = streams(a), streams(b)
             assert len(sa) == len(sb)
-            changed.extend((i, j) for j, (sa_item, sb_item) in enumerate(zip(sa, sb))
-                           if sa_item.read_raw_bytes() != sb_item.read_raw_bytes())
-        assert changed == [(0, run.glyphs[0].stream)]
-        index = run.glyphs[0].stream
-        a, b = (streams(pdf.pages[0])[index] for pdf in (before, after))
-        ignore = {'BT', 'ET', 'Tf', 'Tj', 'Tw', 'Tc', 'Ts', 'Tz', 'Tm', 'Tr', 'q', 'Q'}
-        instructions = lambda stream: [str(op) + ' ' + ' '.join(map(str, args))
-                                       for args, op in q.parse_content_stream(stream) if str(op) not in ignore]
-        assert instructions(a) == instructions(b)
+            assert [item.read_raw_bytes() for item in sa] == [item.read_raw_bytes() for item in sb]
     with pdfium.PdfDocument(source) as before, pdfium.PdfDocument(target) as after:
         sheet = Sheet(*before[0].get_size(), before[0].get_bbox(), 0)
         a = box(sheet.to_screen, run.bounds)
@@ -107,7 +103,11 @@ def test_inventor_acceptance(tmp_path):
                 x, y = (int(v*scale)-100 for v in bounds[:2])
                 width, height = [int((bounds[k+2]-bounds[k])*scale)+200 for k in range(2)]
                 assert_pixels(p1, p2, bounds, scale, (x, y, width, height))
-                text = p2.get_textpage().get_text_bounded(*settings['extract'])
+                textpage = p2.get_textpage()
+                try:
+                    text = textpage.get_text_bounded()
+                finally:
+                    textpage.close()
                 assert settings['new'] in text and settings['old'] not in text
             p1.close()
             p2.close()
@@ -149,13 +149,24 @@ def test_source_protection_and_atomic_failure(tmp_path):
         write_copy(path, path, [])
     signed = tmp_path / 'signed.pdf'
     with q.Pdf.open(path) as doc:
-        doc.Root.Perms = q.Dictionary()
+        signature = doc.make_indirect(q.Dictionary(
+            Type=q.Name.Sig, ByteRange=q.Array([0, 10, 20, 10]),
+            Contents=q.String(b'0'*64)))
+        doc.Root.Perms = q.Dictionary(DocMDP=signature)
         doc.save(signed)
     output = tmp_path / 'untouched.pdf'
     output.write_bytes(b'previous revision')
     with pytest.raises(ValueError, match='Signed'):
         write_copy(signed, output, [])
     assert output.read_bytes() == b'previous revision'
+    # An empty /Perms dictionary is not a signature; 0.3 must not false-positive.
+    empty = tmp_path / 'empty-perms.pdf'
+    with q.Pdf.open(path) as doc:
+        doc.Root.Perms = q.Dictionary()
+        doc.save(empty)
+    empty_copy = tmp_path / 'empty-perms-copy.pdf'
+    write_copy(empty, empty_copy, [])
+    assert empty_copy.is_file() and empty_copy.stat().st_size > 0
     protected = tmp_path / 'locked.pdf'
     with q.Pdf.open(path) as doc:
         doc.save(protected, encryption=q.Encryption(user='', owner='owner-password'))

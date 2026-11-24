@@ -1,0 +1,71 @@
+VECTOR PDF — Qt 6.10.3 / PySide6 6.10.3 third-party notices
+=============================================================
+
+VECTOR PDF dynamically links against Qt 6.10.3 libraries supplied by
+PySide6 Essentials 6.10.3. Qt itself contains or links against third-party
+components. This file lists the components known to be present in the
+Windows x64 Qt binaries used by the portable build. It is a notice index,
+not a replacement for the complete license texts shipped by the Qt project.
+
+Qt Base and Qt for Python are available under the GNU Lesser General Public
+License version 3 (LGPL-3.0). The full LGPL-3.0 and GPL-3.0 texts are in
+licenses/LGPL-3.0.txt and licenses/GPL-3.0.txt. VECTOR PDF ships Qt as
+separate DLLs so that users may replace them with compatible builds, as
+required by LGPL-3.0 section 4.
+
+Component inventory (Qt 6.10.3 Windows x64):
+
+  FreeType 2
+    License: FreeType License (FTL) or GNU GPL v2
+    Source:  https://gitlab.freedesktop.org/freetype/freetype
+
+  HarfBuzz
+    License: MIT
+    Source:  https://github.com/harfbuzz/harfbuzz
+
+  libpng
+    License: libpng License
+    Source:  http://www.libpng.org/pub/png/libpng.html
+
+  zlib
+    License: zlib License
+    Source:  https://zlib.net/
+
+  PCRE2
+    License: BSD-3-Clause
+    Source:  https://github.com/PCRE2Project/pcre2
+
+  md4c
+    License: MIT
+    Source:  https://github.com/mity/md4c
+
+  TinyCBOR
+    License: MIT
+    Source:  https://github.com/intel/tinycbor
+
+  double-conversion
+    License: BSD-3-Clause
+    Source:  https://github.com/google/double-conversion
+
+  Earcut
+    License: ISC
+    Source:  https://github.com/mapbox/earcut.hpp
+
+  Bresenham / qdrawhelper raster helpers
+    License: Qt Company / LGPL-3.0 (part of Qt Gui)
+    Source:  https://code.qt.io/cgit/qt/qtbase.git/tree/src/gui/painting
+
+  Mesa / ANGLE / opengl32sw (only if shipped by the Qt package)
+    License: MIT-style / BSD-style / LGPL-3.0 components
+    Source:  https://code.qt.io/cgit/qt/qtbase.git/tree/src/3rdparty
+
+  Microsoft Visual C++ Runtime
+    License: Microsoft redistributable terms
+    Source:  https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
+
+The exact file list is generated in the release SBOM (sbom.cdx.json). If a
+component is present in a future Qt build but is not listed here, the Qt
+source archive at https://code.qt.io/cgit/qt/qtbase.git/tag/?h=v6.10.3 is
+the authoritative inventory and carries the complete notices.
+
+Corresponding source and written offer: see licenses/LGPL-3.0-SOURCE-OFFER.txt.

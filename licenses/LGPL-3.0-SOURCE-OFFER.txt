@@ -1,0 +1,46 @@
+VECTOR PDF — LGPL-3.0 Corresponding Source offer
+=================================================
+
+VECTOR PDF includes Qt 6.10.3 and PySide6/Shiboken 6.10.3 libraries under
+the GNU Lesser General Public License version 3. The libraries are shipped
+as separate, replaceable DLL/pyd files in:
+
+    runtime\Lib\site-packages\PySide6\
+
+This is a written offer, valid for at least three (3) years from the date of
+the release that contains this file, to provide the Corresponding Source for
+the LGPL-3.0 components distributed with that release.
+
+Corresponding Source means the preferred form for modification, including
+the build and installation scripts and any patches used for the binaries in
+this release. VECTOR PDF does not modify Qt or PySide6 sources; the binaries
+are built from the upstream releases listed below.
+
+Upstream source archives and repositories:
+
+  Qt 6.10.3
+    https://code.qt.io/cgit/qt/qtbase.git/tag/?h=v6.10.3
+    https://download.qt.io/official_releases/qt/6.10/6.10.3/submodules/
+
+  PySide6 / Shiboken 6.10.3
+    https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.10.3
+
+  CPython 3.12.10 (PSF License, not LGPL)
+    https://www.python.org/downloads/release/python-31210/
+
+  Build notes for the Windows x64 portable bundle
+    tools/package_windows.py in the VECTOR PDF source release
+    (Python 3.12 x64 embeddable ZIP + the pinned wheels in requirements.txt)
+
+To obtain a copy of the Corresponding Source on physical media, or if the
+links above are unavailable, contact the project maintainers through:
+
+    https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/issues
+
+Please include the VECTOR PDF version and the requested component name.
+Reasonable cost recovery for media and shipping may be charged where the
+LGPL permits it.
+
+This offer does not limit any rights granted by LGPL-3.0. The full license
+text is in licenses/LGPL-3.0.txt. VECTOR PDF's own code is MIT-licensed; see
+LICENSE. This document is a technical compliance notice, not legal advice.

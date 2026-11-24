@@ -1,4 +1,4 @@
-from math import ceil, floor, hypot, log
+from math import ceil, floor, hypot, isfinite, log
 from time import perf_counter
 
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
@@ -8,10 +8,19 @@ from PySide6.QtWidgets import QApplication, QWidget
 from .geometry import box, inverse, point
 from .render import TILE, Tile, overlap
 
+MIN_ZOOM, MAX_ZOOM = .01, 24.
+PREVIEW_FAMILIES = {
+    'ISO 3098': 'osifont',
+    'Sans': 'DejaVu Sans',
+    'Serif': 'DejaVu Serif',
+    'Mono': 'DejaVu Sans Mono',
+}
+
 
 class Canvas(QWidget):
     area = Signal(object)
     hit = Signal(object)
+    edit_hit = Signal(object)
     coordinate = Signal(object)
     zoomed = Signal(float)
     demand = Signal(object)
@@ -23,10 +32,11 @@ class Canvas(QWidget):
         self.setObjectName('drawing')
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.setMinimumSize(370, 280)
+        self.setMinimumSize(240, 180)
         self.sheet = None
         self.page = 0
-        self.zoom = 1.
+        self._zoom = 1.
+        self.fit_page = True
         self.rotation = 0
         self.pan = QPointF()
         self.cache = None
@@ -45,18 +55,55 @@ class Canvas(QWidget):
         self.timer = QTimer(self, singleShot=True, interval=20)
         self.timer.timeout.connect(self.request)
 
-    def set_sheet(self, page, sheet, fit=True):
+    def sheet_valid(self):
+        sheet = self.sheet
+        if sheet is None:
+            return False
+        try:
+            values = (sheet.width, sheet.height, *sheet.crop)
+            return (all(isfinite(value) for value in values) and sheet.width > 0
+                    and sheet.height > 0 and sheet.crop[2] > sheet.crop[0]
+                    and sheet.crop[3] > sheet.crop[1])
+        except (TypeError, ValueError):
+            return False
+
+    @property
+    def zoom(self):
+        return self._zoom
+
+    @zoom.setter
+    def zoom(self, value):
+        self._zoom = value
+        self.fit_page = False
+
+    def set_sheet(self, page, sheet, fit=True, view_state=None):
         self.page, self.sheet = page, sheet
         self.cancel_move()
+        self.drag = None
         self.selection = self.marquee = self.preview = None
         self.move_enabled = False
+        self.move_bounds = None
         if fit:
-            self.rotation = 0
+            self.restore_view(*(view_state or (None, 0)))
+        elif self.fit_page:
             self.fit()
         else:
             self.refresh()
 
+    def view_state(self):
+        return (None if self.fit_page else self.zoom), self.rotation
+
+    def restore_view(self, zoom, rotation):
+        self.rotation = rotation
+        if zoom is None:
+            self.fit()
+            return
+        self.zoom = zoom
+        self.center_sheet()
+
     def transform(self):
+        if not self.sheet_valid():
+            return QTransform()
         t = QTransform()
         t.translate(self.pan.x(), self.pan.y())
         t.scale(self.zoom, self.zoom)
@@ -71,15 +118,20 @@ class Canvas(QWidget):
 
     def refresh(self):
         self.update()
-        if self.sheet and not self.timer.isActive():
+        if self.sheet_valid() and not self.timer.isActive():
             self.timer.start()
 
     def visible(self):
-        return self.transform().inverted()[0].mapRect(QRectF(self.rect())).intersected(
+        if not self.sheet_valid():
+            return QRectF()
+        transform, invertible = self.transform().inverted()
+        if not invertible:
+            return QRectF()
+        return transform.mapRect(QRectF(self.rect())).intersected(
             QRectF(0, 0, self.sheet.width, self.sheet.height))
 
     def request(self):
-        if not self.sheet or not self.cache or not self.isVisible():
+        if not self.sheet_valid() or not self.cache or not self.isVisible() or self.zoom <= 0:
             return
         view = self.visible()
         if view.isEmpty():
@@ -87,84 +139,147 @@ class Canvas(QWidget):
             return
         ratio = self.devicePixelRatioF()
         level = round(2.0 ** (round(2*log(self.zoom*ratio, 2))/2), 7)
+        if not isfinite(level) or level <= 0:
+            return
         unit = TILE/level
         cols = range(max(0, floor(view.left()/unit)), min(ceil(self.sheet.width/unit), ceil(view.right()/unit)))
         rows = range(max(0, floor(view.top()/unit)), min(ceil(self.sheet.height/unit), ceil(view.bottom()/unit)))
         center = view.center()
         needed = [Tile(self.page, level, c, r) for r in rows for c in cols]
         needed.sort(key=lambda k: hypot((k.col+.5)*unit-center.x(), (k.row+.5)*unit-center.y()))
-        self.demand.emit([k for k in needed if self.cache.get(k) is None])
+        self.demand.emit([k for k in needed if self.cache.peek(k) is None])
 
     def fit(self):
-        if not self.sheet:
+        self.fit_page = True
+        if self.sheet is None:
             return
+        if self.sheet_valid():
+            w, h = self.sheet_size()
+            available_w, available_h = max(20, self.width()-48), max(20, self.height()-48)
+            scale = min(available_w/w, available_h/h)
+            self._zoom = min(MAX_ZOOM, scale) if isfinite(scale) and scale > 0 else 1.
+        else:
+            self._zoom = 1.
+        self.center_sheet()
+
+    def sheet_size(self):
         w, h = self.sheet.width, self.sheet.height
-        if self.rotation in (90, 270):
-            w, h = h, w
-        scale = max(.01, min((self.width()-48)/w, (self.height()-48)/h))
-        self.zoom = scale
-        self.pan = QPointF((self.width()-w*scale)/2, (self.height()-h*scale)/2)
+        return (h, w) if self.rotation in (90, 270) else (w, h)
+
+    def center_sheet(self):
+        self.pan = QPointF()
+        if self.sheet_valid():
+            w, h = self.sheet_size()
+            self.pan = QPointF((self.width()-w*self.zoom)/2, (self.height()-h*self.zoom)/2)
         self.zoomed.emit(self.zoom)
         self.refresh()
 
     def rotate(self):
-        if not self.sheet:
+        if not self.sheet_valid():
+            return
+        if self.fit_page:
+            self.rotation = (self.rotation+90)%360
+            self.fit()
             return
         center = QPointF(self.rect().center())
-        anchor = self.transform().inverted()[0].map(center)
+        transform, invertible = self.transform().inverted()
+        if not invertible:
+            return
+        anchor = transform.map(center)
         self.rotation = (self.rotation+90)%360
         self.pan += center-self.transform().map(anchor)
+        self.zoomed.emit(self.zoom)
         self.refresh()
 
-    def zoom_at(self, multiplier, anchor=None):
-        if not self.sheet:
+    def zoom_at(self, multiplier, anchor=None, *, manual=True):
+        if not self.sheet_valid():
             return
         anchor = anchor if anchor is not None else QPointF(self.rect().center())
-        world = self.transform().inverted()[0].map(anchor)
-        self.zoom = min(24., max(.01, self.zoom*multiplier))
+        transform, invertible = self.transform().inverted()
+        if not invertible:
+            return
+        world = transform.map(anchor)
+        zoom = min(MAX_ZOOM, max(min(MIN_ZOOM, self.zoom), self.zoom*multiplier))
+        if manual:
+            self.zoom = zoom
+        else:
+            self._zoom = zoom
         self.pan += anchor-self.transform().map(world)
         self.zoomed.emit(self.zoom)
         self.refresh()
 
     def document_point(self, where):
-        local = self.transform().inverted()[0].map(where)
-        return point(inverse(self.sheet.to_screen), local.x(), local.y())
+        if not self.sheet_valid():
+            return 0., 0.
+        transform, invertible = self.transform().inverted()
+        if not invertible:
+            return 0., 0.
+        local = transform.map(where)
+        try:
+            return point(inverse(self.sheet.to_screen), local.x(), local.y())
+        except (KeyError, ZeroDivisionError, TypeError, ValueError):
+            return 0., 0.
 
     def set_mode(self, mode):
         if self.mode != mode:
             self.cancel_move()
+            self.drag = None
+            self.marquee = None
+            self.move_bounds = None
         self.mode = mode
         self.setCursor(Qt.CursorShape.OpenHandCursor if mode == 'view' else Qt.CursorShape.CrossCursor)
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y() or event.pixelDelta().y()
         if delta and self.sheet:
-            self.zoom_at(1.18**(delta/120.), event.position())
+            if self.drag:
+                if self.drag[0] == 'move':
+                    self.move_preview.emit(None)
+                self.drag = None
+                self.marquee = None
+                self.move_bounds = None
+                self.set_mode(self.mode)
+                self.update()
+            self.zoom_at(1.18**(delta/120.), event.position(), manual=False)
             event.accept()
 
     def mousePressEvent(self, event):
-        if not self.sheet:
+        if not self.sheet_valid():
             return
         left = event.button() == Qt.MouseButton.LeftButton
-        if event.button() == Qt.MouseButton.MiddleButton or (left and self.mode == 'view'):
+        if event.button() == Qt.MouseButton.MiddleButton or (left and self.mode == 'view' and not self.drag):
             self.drag = ('pan', event.position(), self.pan)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        elif left and self.on_selection(event.position()):
+        elif left and self.mode == 'region':
+            # The area tool always starts a marquee, even over a previous selection.
+            self.drag = ('region', event.position(), None)
+            self.marquee = QRectF(event.position(), event.position())
+            self.update()
+        elif left and self.mode == 'text' and self.on_selection(event.position()):
             self.setFocus()
             self.drag = ('move', event.position(), self.document_point(event.position()))
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        elif left and self.mode == 'region':
-            self.drag = ('region', event.position(), None)
-            self.marquee = QRectF(event.position(), event.position())
         elif left:
             self.hit.emit(self.document_point(event.position()))
 
+    def mouseDoubleClickEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton and self.mode != 'region'
+                and self.sheet_valid()):
+            self.cancel_move()
+            self.drag = None
+            self.set_mode(self.mode)
+            self.edit_hit.emit(self.document_point(event.position()))
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
-        if not self.sheet:
+        if not self.sheet_valid():
             return
         self.coordinate.emit(self.document_point(event.position()))
         if self.drag and self.drag[0] == 'pan':
-            self.pan = self.drag[2]+event.position()-self.drag[1]
+            delta = event.position()-self.drag[1]
+            self.pan = self.drag[2]+delta
             self.refresh()
         elif self.drag and self.drag[0] == 'move':
             if (delta := self.move_delta(event.position())) is not None:
@@ -177,7 +292,7 @@ class Canvas(QWidget):
                            else Qt.CursorShape.CrossCursor)
 
     def on_selection(self, where):
-        if not self.move_enabled or not self.selection or self.mode == 'view':
+        if not self.move_enabled or not self.selection or self.mode != 'text':
             return False
         x, y = self.document_point(where)
         l, b, r, t = self.selection
@@ -207,47 +322,66 @@ class Canvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if not self.drag:
+            self.marquee = None
             return
-        if self.drag[0] == 'move':
-            if event.button() != Qt.MouseButton.LeftButton:
-                return
+        kind = self.drag[0]
+        left = event.button() == Qt.MouseButton.LeftButton
+        if kind == 'move' and left:
             delta = self.move_delta(event.position())
             self.drag = None
             self.move_finished.emit(delta)
-        elif self.drag[0] == 'region':
+        elif kind == 'region' and left:
             x, y = self.document_point(self.drag[1])
             u, v = self.document_point(event.position())
+            self.drag = None
+            self.marquee = None
             self.area.emit((min(x, u), min(y, v), max(x, u), max(y, v)))
+        elif kind == 'move':
+            # A release of another button cancels the move without committing.
+            self.move_preview.emit(None)
+            self.move_bounds = None
+        # Any release clears every kind of drag, including pan and region.
         self.drag = None
         self.marquee = None
         self.set_mode(self.mode)
         self.update()
 
     def resizeEvent(self, event):
-        self.refresh()
+        if self.fit_page and self.sheet is not None:
+            self.fit()
+        else:
+            self.refresh()
         super().resizeEvent(event)
 
     def showEvent(self, event):
         self.refresh()
         super().showEvent(event)
 
+    def tiles_for_paint(self):
+        if not self.sheet_valid() or not self.cache:
+            return []
+        view = self.visible()
+        if view.isEmpty():
+            return []
+        wanted = (view.left(), view.top(), view.right(), view.bottom())
+        items = [(key, image) for key, image in self.cache.items()
+                 if key.page == self.page and overlap(key.bounds, wanted)]
+        # Draw low resolution first and the sharpest tiles last.
+        items.sort(key=lambda entry: entry[0].level)
+        return items
+
     def paintEvent(self, event):
         start = perf_counter()
         painter = QPainter(self)
         painter.fillRect(event.rect(), QColor(self.surface))
-        if self.sheet:
+        if self.sheet_valid():
             painter.setTransform(self.transform())
             sheet_rect = QRectF(0, 0, self.sheet.width, self.sheet.height)
             painter.fillRect(sheet_rect.adjusted(5, 5, 5, 5), QColor(0, 0, 0, 75))
             painter.fillRect(sheet_rect, QColor('#ffffff'))
             painter.setClipRect(sheet_rect)
-            view = self.visible()
-            wanted = (view.left(), view.top(), view.right(), view.bottom())
-            items = [(key, image) for key, image in self.cache.items()
-                     if key.page == self.page and overlap(key.bounds, wanted)]
-            items.sort(key=lambda entry: abs(log(entry[0].level/(self.zoom*self.devicePixelRatioF()))), reverse=True)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            for key, image in items:
+            for key, image in self.tiles_for_paint():
                 px = key.col*TILE/key.level
                 py = key.row*TILE/key.level
                 painter.drawImage(QRectF(px, py, image.width()/key.level, image.height()/key.level), image)
@@ -267,30 +401,64 @@ class Canvas(QWidget):
             self.frame_epoch, self.frames = end, 0
 
     def paint_selection(self, painter):
+        if not self.sheet_valid():
+            return
         bounds = self.move_bounds or self.selection
         if bounds:
-            l, t, r, b = box(self.sheet.to_screen, bounds)
-            rect = QRectF(l, t, r-l, b-t)
-            painter.fillRect(rect, QColor(20, 130, 238, 36))
-            pen = QPen(QColor('#147ce8'), 1.5, Qt.PenStyle.DashLine)
-            pen.setCosmetic(True)
-            painter.setPen(pen)
-            painter.drawRect(rect)
+            try:
+                l, t, r, b = box(self.sheet.to_screen, bounds)
+                rect = QRectF(l, t, r-l, b-t)
+            except (TypeError, ValueError, ZeroDivisionError, KeyError):
+                rect = None
+            if rect is not None:
+                painter.fillRect(rect, QColor(20, 130, 238, 36))
+                pen = QPen(QColor('#147ce8'), 1.5, Qt.PenStyle.DashLine)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.drawRect(rect)
         if self.preview and self.preview.text:
             edit = self.preview
-            x, y = point(self.sheet.to_screen, edit.x, edit.y)
-            painter.save()
-            painter.translate(x, y)
-            painter.rotate(self.sheet.rotation-edit.angle)
-            if (shear := edit.shear()):
-                painter.shear(-shear, 0.)
-            font = QFont('osifont' if edit.current_font() == 'ISO 3098' else 'DejaVu Sans')
-            font.setItalic(edit.native_italic())
-            font.setPixelSize(max(1, round(edit.size)))
-            painter.setFont(font)
-            painter.setPen(QColor(10, 105, 218, 220))
-            painter.drawText(QPointF(0., 0.), edit.text)
-            painter.restore()
+            try:
+                x, y = point(self.sheet.to_screen, edit.x, edit.y)
+                painter.save()
+                try:
+                    painter.translate(x, y)
+                    painter.rotate(self.sheet.rotation-edit.angle)
+                    if (shear := edit.shear()):
+                        painter.shear(-shear, 0.)
+                    family = edit.current_font()
+                    name = PREVIEW_FAMILIES.get(family)
+                    if name is None and family.startswith('Local · '):
+                        name = family.split(' · ', 1)[1]
+                    font = QFont(name or 'DejaVu Sans')
+                    font.setItalic(edit.native_italic())
+                    font.setPixelSize(max(1, round(edit.size)))
+                    painter.setFont(font)
+                    painter.setPen(preview_color(edit))
+                    painter.drawText(QPointF(0., 0.), edit.text)
+                finally:
+                    painter.restore()
+            except (RuntimeError, TypeError, ValueError, ZeroDivisionError):
+                pass
+
+
+def preview_color(edit):
+    color = None
+    fill = getattr(edit, 'fill_color', None)
+    if callable(fill):
+        try:
+            color = fill()
+        except Exception:
+            color = None
+    if color is None:
+        color = getattr(edit, 'color', None)
+    if color is not None:
+        try:
+            if len(color) == 3:
+                return QColor.fromRgbF(*color)
+        except (TypeError, ValueError):
+            pass
+    return QColor(10, 105, 218, 220)
 
 
 def image_from_render(data):

@@ -1,37 +1,83 @@
-/* Location-independent GUI launcher for the embeddable CPython runtime. */
-typedef unsigned short wchar_t;
-
-__declspec(dllimport) unsigned long __stdcall GetModuleFileNameW(void *, wchar_t *, unsigned long);
-__declspec(dllimport) wchar_t * __stdcall GetCommandLineW(void);
-__declspec(dllimport) int __stdcall lstrlenW(const wchar_t *);
-__declspec(dllimport) wchar_t * __stdcall lstrcpyW(wchar_t *, const wchar_t *);
-__declspec(dllimport) wchar_t * __stdcall lstrcatW(wchar_t *, const wchar_t *);
-__declspec(dllimport) void __stdcall ExitProcess(unsigned int);
-__declspec(dllimport) int __stdcall MessageBoxW(void *, const wchar_t *, const wchar_t *, unsigned int);
-__declspec(dllimport) void * __stdcall ShellExecuteW(void *, const wchar_t *, const wchar_t *,
-                                                    const wchar_t *, const wchar_t *, int);
+/* Minimal GUI bootstrap for the portable CPython runtime.
+ *
+ * It contains no update logic: it locates <application>\runtime\pythonw.exe,
+ * verifies that the file exists, and starts `-m vector_pdf` with the original
+ * command-line tail.  The original arguments are already a valid command-line
+ * fragment, so they are appended verbatim; the executable path is passed as a
+ * separate ShellExecuteW parameter and needs no manual quoting.
+ */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <intrin.h>
 
 #define CAPACITY 32768
-static wchar_t executable[CAPACITY];
-static wchar_t command[CAPACITY];
+#define APP_ID L"VectorPDF.Desktop"
 
-static void fail(const wchar_t *message)
+__declspec(dllimport) HRESULT __stdcall
+SetCurrentProcessExplicitAppUserModelID(const wchar_t *application_id);
+
+/* /GS support for a CRT-free image.  The cookie is process-wide and is only a
+ * compiler-generated stack-canary guard; there are no local buffers here, but
+ * keeping the definitions makes the /GS build self-contained. */
+unsigned __int64 __security_cookie = 0x00002B992DDFA232ULL;
+
+void __cdecl __security_check_cookie(unsigned __int64 cookie)
 {
-    MessageBoxW(0, message, L"VECTOR PDF", 0x10);
+    if (cookie != __security_cookie)
+        ExitProcess(3);
+}
+
+/* MSVC emits this for range-check failures even without a CRT. */
+__declspec(noreturn) void __cdecl __report_rangecheckfailure(void)
+{
+    __fastfail(FAST_FAIL_RANGE_CHECK_FAILURE);
+}
+
+static wchar_t application[CAPACITY];
+static wchar_t runtime[CAPACITY];
+static wchar_t command[CAPACITY];
+static wchar_t message[CAPACITY];
+
+static void fail(const wchar_t *text)
+{
+    MessageBoxW(NULL, text, L"VECTOR PDF", MB_OK | MB_ICONERROR);
     ExitProcess(1);
+}
+
+static void fail_with_path(const wchar_t *prefix, const wchar_t *path)
+{
+    lstrcpynW(message, prefix, CAPACITY);
+    int used = lstrlenW(message);
+    int room = CAPACITY - used - 160;
+    if (room > 1)
+        lstrcpynW(message + used, path, room);
+    lstrcatW(message,
+             L"\n\nThe portable package is incomplete. Extract the complete "
+             L"ZIP into a writable folder and try again.");
+    fail(message);
 }
 
 void start(void)
 {
-    const unsigned long length = GetModuleFileNameW(0, executable, CAPACITY);
-    if (!length || length >= CAPACITY - 32)
-        fail(L"Unable to locate the portable runtime.");
+    DWORD length = GetModuleFileNameW(NULL, application, CAPACITY);
+    if (length == 0 || length >= CAPACITY - 32)
+        fail(L"VECTOR PDF could not determine its installation folder.");
 
-    unsigned long slash = length;
-    while (slash > 0 && executable[slash - 1] != L'\\')
+    DWORD slash = length;
+    while (slash > 0 && application[slash - 1] != L'\\')
         --slash;
-    executable[slash] = 0;
-    lstrcatW(executable, L"runtime\\pythonw.exe");
+    if (slash == 0)
+        fail(L"VECTOR PDF could not determine its installation folder.");
+    application[slash] = 0;
+
+    lstrcpynW(runtime, application, CAPACITY);
+    lstrcatW(runtime, L"runtime\\pythonw.exe");
+    DWORD attributes = GetFileAttributesW(runtime);
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        fail_with_path(L"VECTOR PDF could not find its Python runtime:\n\n",
+                       runtime);
 
     const wchar_t *tail = GetCommandLineW();
     if (*tail == L'"') {
@@ -44,12 +90,27 @@ void start(void)
         while (*tail && *tail != L' ' && *tail != L'\t')
             ++tail;
     }
-    if (lstrlenW(tail) + 32 >= CAPACITY)
-        fail(L"The file path is too long.");
+    const int tail_length = lstrlenW(tail);
+    /* "-m vector_pdf" is 13 characters; the Windows limit is 32767 including
+     * the terminator. */
+    if (13 + tail_length >= 32767)
+        fail(L"The command line is too long. Shorten the PDF path and try "
+             L"again.");
+    if (13 + tail_length + 1 > CAPACITY)
+        fail(L"The command line is too long.");
 
     lstrcpyW(command, L"-m vector_pdf");
     lstrcatW(command, tail);
-    if ((__int64)ShellExecuteW(0, L"open", executable, command, 0, 1) <= 32)
-        fail(L"Unable to start VECTOR PDF. Extract the complete ZIP before launching it.");
+
+    SetCurrentProcessExplicitAppUserModelID(APP_ID);
+    HINSTANCE result = ShellExecuteW(NULL, L"open", runtime, command, NULL,
+                                     SW_SHOWNORMAL);
+    if ((INT_PTR)result <= 32) {
+        wsprintfW(message,
+                  L"VECTOR PDF could not start its Python runtime.\n\n"
+                  L"Windows error %d. Extract the complete ZIP and try again.",
+                  (int)(INT_PTR)result);
+        fail(message);
+    }
     ExitProcess(0);
 }
