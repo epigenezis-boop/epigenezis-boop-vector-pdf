@@ -107,3 +107,10 @@ jobs:
           $env:QT_QPA_PLATFORM = 'offscreen'
           & 'smoke/Vector PDF/runtime/python.exe' -c "from PySide6.QtWidgets import QApplication; from vector_pdf.ui import MainWindow; app=QApplication([]); w=MainWindow(); w.show(); app.processEvents(); w.close()"
           if ($LASTEXITCODE) { throw 'Packaged application smoke test failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vector-pdf-windows-package
+          path: |
+            release/*.zip
+            release/manifest.json
+          if-no-files-found: error

@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <intrin.h>
 
 #define CAPACITY 32768
 #define APP_ID L"VectorPDF.Desktop"
@@ -25,6 +26,12 @@ void __cdecl __security_check_cookie(unsigned __int64 cookie)
 {
     if (cookie != __security_cookie)
         ExitProcess(3);
+}
+
+/* MSVC emits this for range-check failures even without a CRT. */
+__declspec(noreturn) void __cdecl __report_rangecheckfailure(void)
+{
+    __fastfail(FAST_FAIL_RANGE_CHECK_FAILURE);
 }
 
 static wchar_t application[CAPACITY];
