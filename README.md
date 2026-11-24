@@ -10,9 +10,9 @@
 
 ## Запуск в Windows
 
-[Последний выпуск на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/latest)
+[Релиз Vector 0.3.0 на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/tag/v0.3.0) · [Скачать ZIP для Windows x64](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/download/v0.3.0/Vector-0.3.0-Windows-x64-Portable.zip)
 
-Распакуйте архив `VECTOR-PDF-0.3.0-win-x64.zip` целиком и запустите
+Распакуйте архив `Vector-0.3.0-Windows-x64-Portable.zip` целиком и запустите
 `VectorPDF.exe`. В комплекте CPython 3.12.10 и библиотеки; установка, права
 администратора и отдельный Python не нужны.
 
