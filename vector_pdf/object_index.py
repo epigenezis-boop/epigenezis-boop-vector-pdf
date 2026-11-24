@@ -9,9 +9,9 @@ from .fonts import read_font
 from .geometry import IDENTITY, box, compose, similarity, text_transform, union
 
 SHOW = {'Tj', 'TJ', "'", '"'}
-OPS = ('q Q cm gs BT ET Tf Tr Tm Tc Tw Tz Ts Td TD T* Tj TJ \' " Do BMC BDC EMC '
+OPS = ('q Q cm gs BT ET Tf Tr Tm Tc Tw Tz Ts TL Td TD T* Tj TJ \' " Do BMC BDC EMC '
        'rg g k RG G K cs CS sc scn SCN re W W* n S s f F f* B B* b b* sh BI ID EI')
-STYLES = {'Tc': 'spacing', 'Tw': 'word_space', 'Tz': 'horizontal', 'Ts': 'rise', 'Tr': 'mode'}
+STYLES = {'TL': 'leading', 'Tc': 'spacing', 'Tw': 'word_space', 'Tz': 'horizontal', 'Ts': 'rise', 'Tr': 'mode'}
 PAINT = {'S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'sh', 'Do', 'BI', 'ID', 'EI'}
 DEVICE_SPACES = {'/DeviceGray', '/DeviceRGB', '/DeviceCMYK', '/G', '/RGB', '/CMYK'}
 
@@ -33,6 +33,7 @@ class Graphics:
     word_space: float = 0
     horizontal: float = 100
     rise: float = 0
+    leading: float = 0
     unsafe: bool = False
     fill: tuple | None = None
     color_space: str = '/DeviceGray'
@@ -59,6 +60,12 @@ class Glyph:
     clipped: bool = False
     reason: str = ''
     paint_epoch: int = 0
+    clip_scope: tuple = ()
+    operator: str = 'Tj'
+    operand: tuple = ()
+    leading_advance: float = 0.
+    trailing_advance: float = 0.
+    shared: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,7 @@ class TextRun:
     bounds: tuple
     spaces: tuple = ()
     reason: str = ''
+    font_key: str = ''
 
     @property
     def text(self):
@@ -111,8 +119,8 @@ def gap(first, second, fonts):
     b = compose(second.ctm, second.matrix)
     if (first.stream != second.stream or first.ordinal+1 != second.ordinal or
             fonts[first.font_key].name != fonts[second.font_key].name or
-            first.font_key != second.font_key or first.scope != second.scope or
-            first.fill != second.fill or first.clipped != second.clipped or
+            first.scope != second.scope or first.fill != second.fill or
+            first.clip_scope != second.clip_scope or
             first.paint_epoch != second.paint_epoch or
             first.ctm != second.ctm or first.horizontal != second.horizontal or
             first.isolated != second.isolated or abs(first.size-second.size) > .02 or
@@ -127,11 +135,49 @@ def gap(first, second, fonts):
     em = first.size * scale
     spacing = along - first.advance*scale
     # Limit the gap to a typographic word space to keep adjacent table cells separate.
-    space = fonts[first.font_key].space_width
-    limit = min(.34, max(.18, space*1.2))*em
-    if along <= 0 or across >= .12*em or spacing > limit:
+    space = fonts[first.font_key].space_width * first.horizontal * em
+    limit = min(.40*em, max(.25*em, space*1.3))
+    if along <= 0 or across >= .12*em or not -.25*em <= spacing <= limit:
         return None
-    return spacing > .21*em and not (first.text[-1].isspace() or second.text[0].isspace())
+    return spacing > .6*space and not (first.text[-1].isspace() or second.text[0].isspace())
+
+
+def show_operand(operator, obj):
+    if operator == 'Tj' and isinstance(obj, q.String):
+        return (bytes(obj),)
+    if operator == 'TJ' and isinstance(obj, q.Array):
+        return tuple(bytes(part) if isinstance(part, q.String) else float(part) for part in obj)
+    return ()
+
+
+def show_text(operand, font):
+    """Decode a show and retain the leading and trailing TJ adjustments in ems."""
+    text, data = [], []
+    advance = offset = pending = 0.
+    for item in operand:
+        if isinstance(item, bytes):
+            value = font.decode(item)
+            if value is None:
+                return None
+            if not value:
+                continue
+            if not text:
+                offset = pending
+            elif pending > min(.40, 1.3*font.space_width):
+                # A large jump inside an array may position another label.
+                return None
+            elif pending > .6*font.space_width and not (text[-1][-1].isspace() or value[0].isspace()):
+                text.append(' ')
+            text.append(value)
+            data.append(item)
+            advance += font.width(item)
+            pending = 0.
+        else:
+            if not isfinite(item):
+                return None
+            pending -= item/1000
+            advance -= item/1000
+    return ''.join(text), b''.join(data), advance, offset, pending
 
 
 def _color(args, space):
@@ -184,9 +230,8 @@ def index_page(path, number):
         stack = []
         marked = []
         mark_id = 0
-        matrix = None
+        matrix = line_matrix = None
         inside = False
-        explicit = False
         candidates = []
         tainted = False
         unbalanced = False
@@ -242,26 +287,31 @@ def index_page(path, number):
                             state = replace(state, unsafe=True)
                             unbalanced = True
                     elif op == 'BT':
-                        matrix, explicit, inside, tainted = IDENTITY, False, True, inside
+                        matrix = line_matrix = IDENTITY
+                        inside, tainted = True, inside
                         candidates = []
                     elif op == 'ET':
                         for glyph in candidates:
-                            safe = (not tainted and len(candidates) == 1 and
-                                    glyph.scope == tuple(marked) and glyph.isolated)
+                            safe = not tainted and glyph.scope == tuple(marked) and glyph.isolated
                             reason = glyph.reason
                             if not safe and not reason:
                                 reason = 'unsupported text structure'
-                            glyphs.append(replace(glyph, isolated=safe, reason=reason))
+                            glyphs.append(replace(glyph, isolated=safe, reason=reason, shared=len(candidates) > 1))
                         inside, candidates = False, []
                     elif op == 'Tf' and len(args) == 2:
                         state = replace(state, font=str(args[0]), size=float(args[1]))
                     elif op in STYLES and len(args) == 1:
                         state = replace(state, **{STYLES[op]: float(args[0])})
                     elif op == 'Tm' and inside and len(args) == 6:
-                        matrix, explicit = tuple(float(value) for value in args), True
-                    elif op in ('Td', 'TD', 'T*'):
-                        explicit = False
-                        tainted |= inside
+                        matrix = line_matrix = tuple(float(value) for value in args)
+                    elif op in ('Td', 'TD', 'T*') and inside and line_matrix is not None:
+                        if op == 'T*':
+                            x, y = 0., -state.leading
+                        else:
+                            x, y = map(float, args)
+                            if op == 'TD':
+                                state = replace(state, leading=-y)
+                        matrix = line_matrix = compose(line_matrix, (*IDENTITY[:4], x, y))
                     elif op in ('rg', 'g', 'k'):
                         space = {'rg': '/DeviceRGB', 'g': '/DeviceGray', 'k': '/DeviceCMYK'}[op]
                         color = _color(args, space)
@@ -296,23 +346,30 @@ def index_page(path, number):
                         ordinal += 1
                         objects += 1
                         font = fonts.get(state.font)
-                        if not (inside and explicit and matrix and op == 'Tj' and len(args) == 1 and
-                                isinstance(args[0], q.String) and font and 0 < state.size <= 5000):
+                        operand = show_operand(op, args[0]) if len(args) == 1 else ()
+                        if not (inside and matrix is not None and operand and font and 0 < state.size <= 5000):
                             tainted = True
-                            explicit = False
+                            matrix = None
+                            if op in ("'", '"'):
+                                line_matrix = None
                             continue
-                        data = bytes(args[0])
-                        text = font.decode(data)
-                        if text is None:
+                        decoded = show_text(operand, font)
+                        if decoded is None:
                             tainted = True
-                            explicit = False
+                            matrix = None
                             continue
+                        text, data, advance, offset, trailing = decoded
                         horizontal = state.horizontal / 100
-                        advance = font.width(data)*state.size*horizontal
-                        shape = compose(state.ctm, matrix)
+                        unit = state.size*horizontal
+                        start_matrix = compose(matrix, (*IDENTITY[:4], offset*unit, state.rise))
+                        shape = compose(state.ctm, start_matrix)
+                        matrix = compose(matrix, (*IDENTITY[:4], advance*unit, 0.))
+                        advance = (advance-offset-trailing)*unit
                         if not isfinite(advance) or not all(isfinite(value) for value in shape):
-                            explicit = False
+                            matrix = None
                             tainted = True
+                            continue
+                        if not text:
                             continue
                         left, bottom, right, top = font.bounds
                         bounds = box(shape, (min(0, left)*state.size*horizontal, min(bottom, font.descender)*state.size,
@@ -337,17 +394,19 @@ def index_page(path, number):
                             blocking.append('horizontal scaling')
                         if state.rise or state.spacing or state.word_space:
                             blocking.append('text spacing')
+                            if state.spacing or state.word_space:
+                                matrix = None
                         if similarity(state.ctm) is None or text_transform(shape) is None:
                             blocking.append('unsupported transform')
-                        candidates.append(Glyph(stream_number, ordinal, text, data, state.font, matrix,
+                        candidates.append(Glyph(stream_number, ordinal, text, data, state.font, start_matrix,
                                                 state.ctm, state.size, advance, horizontal, bounds, tuple(marked),
                                                 not blocking, state.fill, bool(state.clip),
-                                                '; '.join(blocking+notes), paint_epoch))
-                        explicit = False
+                                                '; '.join(blocking+notes), paint_epoch, state.clip, op,
+                                                operand, offset, trailing))
                 except (ValueError, TypeError, OverflowError, ZeroDivisionError):
                     state = replace(state, unsafe=True)
                     tainted |= inside
-                    explicit = False
+                    matrix = line_matrix = None
         runs, collected, spaces = [], [], []
         for glyph in glyphs:
             if collected:
@@ -372,5 +431,10 @@ def append(runs, glyphs, fonts, spaces):
     if not ''.join(g.text for g in glyphs).strip():
         return
     reasons = sorted({reason for glyph in glyphs for reason in glyph.reason.split('; ') if reason})
-    runs.append(TextRun(len(runs), tuple(glyphs), fonts[glyphs[0].font_key],
-                        union(g.bounds for g in glyphs), tuple(spaces), '; '.join(reasons)))
+    font_counts = {}
+    for glyph in glyphs:
+        count = sum(char.isalnum() for char in glyph.text)
+        font_counts[glyph.font_key] = font_counts.get(glyph.font_key, 0) + count
+    font_key = max(font_counts, key=font_counts.get)
+    runs.append(TextRun(len(runs), tuple(glyphs), fonts[font_key],
+                        union(g.bounds for g in glyphs), tuple(spaces), '; '.join(reasons), font_key))

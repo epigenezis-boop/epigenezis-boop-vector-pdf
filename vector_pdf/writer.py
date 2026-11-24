@@ -11,7 +11,7 @@ import pikepdf as q
 
 from .fonts import FALLBACKS, fallback
 from .geometry import box, compose, translate_angle, union
-from .object_index import SHOW, streams
+from .object_index import SHOW, show_operand, streams
 
 ITALIC_SHEAR = tan(radians(12))
 
@@ -34,35 +34,25 @@ class Edit:
     def from_run(cls, page, run):
         return cls(page, run.id, run.text, *run.placement, original=run)
 
+    def keeps_placement(self):
+        return self.original is not None and all(abs(a-b) <= .001 for a, b in zip(
+            (self.x, self.y, self.size, self.angle), self.original.placement
+        )) and abs(self.shear()-self.original.shear) <= .001
+
+    def keeps_fill(self):
+        fill = self.original.glyphs[0].fill
+        return self.color is None or (fill is not None and
+                                      all(abs(a-b) <= .002 for a, b in zip(self.color, fill)))
+
     def native_codes(self):
-        glyphs = self.original.glyphs if self.original else ()
-        if (not self.original or self.family != 'Original' or
-                abs(self.shear()-self.original.shear) > .001):
+        if (not self.keeps_placement() or self.family != 'Original' or not self.keeps_fill()
+                or len(self.original.glyphs) != 1):
             return None
-        if any(abs(a-b) > .001 for a, b in zip((self.x, self.y, self.size, self.angle), self.original.placement)):
+        glyph = self.original.glyphs[0]
+        if glyph.operator != 'Tj' or glyph.shared or len(self.text) != len(glyph.text):
             return None
-        if len(glyphs) != 1 or self.original.spaces:
-            return None
-        if any(g.font_key != glyphs[0].font_key for g in glyphs):
-            return None
-        if self.color is not None:
-            fill = glyphs[0].fill
-            if fill is None or any(abs(a-b) > .002 for a, b in zip(self.color, fill)):
-                return None
-        if len(self.text) != len(self.original.text):
-            return None
-        result = []
-        position = 0
-        for glyph in glyphs:
-            txt = self.text[position:position+len(glyph.text)]
-            code = glyph.data if txt == glyph.text else self.original.font.encode(txt)
-            if code is None:
-                return None
-            result.append(code)
-            position += len(glyph.text)
-        if sum(len(code) for code in result) != sum(len(glyph.data) for glyph in glyphs):
-            return None
-        return result
+        code = glyph.data if self.text == glyph.text else self.original.font.encode(self.text)
+        return [code] if code is not None and len(code) == len(glyph.data) else None
 
     def fill_color(self):
         if self.color is not None:
@@ -98,7 +88,8 @@ class Edit:
 
     def shear(self):
         if self.italic is None and self.original:
-            if abs(self.original.shear) > .001:
+            if abs(self.original.shear) > .001 or (
+                    self.text == self.original.text and self.family == 'Original'):
                 return self.original.shear
             if self.original.font.italic_angle and not self.native_italic():
                 return ITALIC_SHEAR
@@ -121,6 +112,9 @@ class Edit:
         return box(self.matrix(), (0., -.25*self.size, max(width, .1*self.size), .9*self.size))
 
     def _bounds(self):
+        if (self.original and self.text == self.original.text and self.family == 'Original'
+                and self.keeps_placement()):
+            return self.original.bounds
         if not self.text:
             return self.original.bounds if self.original else (self.x, self.y, self.x, self.y)
         codes = self.native_codes()
@@ -150,8 +144,9 @@ def text_bounds(font, data, size, matrix, horizontal):
 class Location:
     position: int
     end: int
-    data: bytes | None
-    after: int | None = None
+    operator: str
+    operand: tuple
+    closed: bool = False
 
 
 class Offsets(q._core.StreamParser):
@@ -160,22 +155,27 @@ class Offsets(q._core.StreamParser):
         self.targets = set(targets)
         self.last = None
         self.ordinal = -1
-        self.open = None
+        self.open = []
         self.output = {}
 
     def handle_object(self, obj, offset, length):
         if isinstance(obj, q.Operator):
-            op = str(obj)
-            if op in SHOW:
+            operator = str(obj)
+            if operator in SHOW:
                 self.ordinal += 1
                 if self.ordinal in self.targets:
-                    if op != 'Tj' or self.last is None:
+                    if self.last is None:
                         raise ValueError('Unsupported text operand.')
-                    self.output[self.ordinal] = self.open = Location(*self.last)
-            elif op == 'ET' and self.open:
-                self.open.after = offset + length
-                self.open = None
-        self.last = (offset, offset+length, bytes(obj)) if isinstance(obj, q.String) else None
+                    position, value = self.last
+                    operand = show_operand(operator, value)
+                    location = Location(position, offset+length, operator, operand)
+                    self.output[self.ordinal] = location
+                    self.open.append(location)
+            elif operator == 'ET':
+                for location in self.open:
+                    location.closed = True
+                self.open.clear()
+        self.last = (offset, obj) if isinstance(obj, (q.String, q.Array)) else None
 
     def handle_eof(self):
         pass
@@ -198,7 +198,7 @@ def text_operator(data):
 def new_run(edit, resource, data, matrix, font_size, added=False, horizontal=1.):
     color = edit.color if edit.color is not None else (edit.fill_color() if edit.original else (0., 0., 0.))
     return (b'\nq\n' + op(color, 'rg') + b'BT\n'
-            + resource.encode('ascii') + b' ' + op([font_size], 'Tf') +
+            + q.Name(resource).unparse() + b' ' + op([font_size], 'Tf') +
             b'0 Tc 0 Tw '+op([horizontal*100], 'Tz')+b'0 Ts 0 Tr\n' + op(matrix, 'Tm') + text_operator(data) + b' Tj\nET\nQ\n')
 
 
@@ -328,17 +328,40 @@ def validate_edit(edit):
 
 def bind_font(pdf, resource_fonts, family, edit):
     if family == 'Original':
-        encoded = edit.original.font.encode(edit.text)
+        font = edit.original.font
+        encoded = font.encode(edit.text)
         if encoded is None:
             raise ValueError('The original font cannot render all characters.')
-        return edit.original.glyphs[0].font_key, encoded
-    new_font, _, encoded = fallback(family, edit.text, pdf=pdf)
+        return edit.original.font_key, font, encoded
+    new_font, font, encoded = fallback(family, edit.text, pdf=pdf)
     token = 1
     while f'/VPFont{token}' in resource_fonts:
         token += 1
     key = f'/VPFont{token}'
     resource_fonts[key] = new_font
-    return key, encoded
+    return key, font, encoded
+
+
+def replace_show(glyph, data=b'', resource=None, width=0.):
+    # In a shared BT/ET block subsequent operators can depend on the text
+    # matrix left by this show. A TJ adjustment preserves its exact advance.
+    before = glyph.leading_advance if data else 0.
+    if glyph.shared or before:
+        advance = (glyph.advance/(glyph.size*glyph.horizontal) + glyph.leading_advance
+                   + glyph.trailing_advance)
+        after = advance-before-width if glyph.shared else 0.
+        items = [number(-1000*before).encode('ascii')] if before else []
+        if data:
+            items.append(text_operator(data))
+        if after or not items:
+            items.append(number(-1000*after).encode('ascii'))
+        show = b'['+b' '.join(items)+b'] TJ'
+    else:
+        show = text_operator(data)+b' Tj'
+    if resource is None or resource == glyph.font_key:
+        return show
+    size = op([glyph.size], 'Tf')
+    return q.Name(resource).unparse()+b' '+size+show+b'\n'+q.Name(glyph.font_key).unparse()+b' '+size
 
 
 def rebuild(pdf, page, edits, balanced=None):
@@ -363,39 +386,44 @@ def rebuild(pdf, page, edits, balanced=None):
             if not edit.text:
                 continue
             family = edit.current_font()
-            resource, data = bind_font(pdf, resource_fonts, family, edit)
+            resource, _, data = bind_font(pdf, resource_fonts, family, edit)
             resources_changed = True
             added.append(new_run(edit, resource, data, edit.matrix(), edit.size, True))
             continue
         glyphs = edit.original.glyphs
+        first = glyphs[0]
+        keeps_style = edit.keeps_placement() and edit.keeps_fill()
+        if keeps_style and edit.family == 'Original' and edit.text == edit.original.text:
+            continue
         codes = edit.native_codes()
         if codes is not None:
-            for code, glyph in zip(codes, glyphs):
-                if code != glyph.data:
-                    plan[glyph.stream].append((glyph, code))
+            plan[first.stream].append((first, replace_show(first, codes[0])))
             continue
-        # A replacement can move, resize or restyle the text. Clear every original
-        # show operand and append one self-contained run outside the original CTM.
-        for glyph in glyphs:
-            plan[glyph.stream].append((glyph, b''))
-        if not edit.text:
-            continue
-        family = edit.current_font()
-        resource, data = bind_font(pdf, resource_fonts, family, edit)
-        resources_changed |= family != 'Original'
-        first = glyphs[0]
-        added.append(new_run(edit, resource, data, edit.matrix(), edit.size, horizontal=first.horizontal))
+        if edit.text:
+            family = edit.current_font()
+            resource, font, data = bind_font(pdf, resource_fonts, family, edit)
+            resources_changed |= family != 'Original'
+        if edit.text and keeps_style:
+            plan[first.stream].append((first, replace_show(first, data, resource, font.width(data))))
+            removed = glyphs[1:]
+        else:
+            removed = glyphs
+            if edit.text:
+                added.append(new_run(edit, resource, data, edit.matrix(), edit.size, horizontal=first.horizontal))
+        for glyph in removed:
+            plan[glyph.stream].append((glyph, replace_show(glyph)))
     for index, jobs in plan.items():
         original = content[index]
         data = original.read_bytes()
         offsets = Offsets([g.ordinal for g, _ in jobs])
         q.Object._parse_stream(original, offsets)
         changes = []
-        for glyph, code in jobs:
+        for glyph, replacement in jobs:
             location = offsets.output.get(glyph.ordinal)
-            if not location or location.data != glyph.data or location.after is None:
+            if (not location or not location.closed or location.operator != glyph.operator
+                    or location.operand != glyph.operand):
                 raise ValueError('Text offsets changed. Reopen the source document.')
-            changes.append((location.position, location.end, text_operator(code)))
+            changes.append((location.position, location.end, replacement))
         patched = splice(data, changes)
         if patched != data:
             target = pdf.make_stream(zlib.compress(patched), Filter=q.Name.FlateDecode)
@@ -434,18 +462,6 @@ def require_balanced_page(page):
             depth[key] += 1
     if any(depth.values()):
         raise ValueError('The original page has unbalanced graphics or text scopes.')
-
-
-_GAP_ALLOWED = {'Tf', 'BT', 'Tm', 'Tr', 'Tc', 'Tw', 'Tz', 'Ts'}
-
-
-def verify_gap(data):
-    # The next Tj's operand is excluded from the range. Every byte still
-    # undergoes QPDF tokenization before the replacement is committed.
-    with q.Pdf.new() as scratch:
-        temporary = scratch.make_stream(data)
-        if any(str(o.operator) not in _GAP_ALLOWED for o in q.parse_content_stream(temporary)):
-            raise ValueError('Other PDF drawing operations are interleaved with this text.')
 
 
 def splice(data, edits):

@@ -109,6 +109,49 @@ def test_split_tj_replacement_has_no_overlap(tmp_path):
     assert second_box[0] > first_box[0]
 
 
+def test_shared_text_block_updates_one_visual_line_in_place(tmp_path):
+    source = tmp_path/'shared-text.pdf'
+    with q.Pdf.new() as pdf:
+        page = pdf.add_blank_page(page_size=(400, 220))
+        font, metrics, _ = fallback('Sans', 'First line Next Longer line', pdf)
+        page.Resources = q.Dictionary(Font=q.Dictionary(F0=font))
+        first, space, last, next_line = (
+            b'<'+metrics.encode(word).hex().encode()+b'>'
+            for word in ('First', ' ', 'line', 'Next')
+        )
+        page.Contents = pdf.make_stream(
+            b'q 0 0 400 220 re W n 0 .5 0 rg BT /F0 18 Tf 24 TL 40 160 Td '
+            + first + b' Tj [' + space + b' ' + last + b'] TJ T* '
+            + next_line + b' Tj ET Q\n'
+        )
+        pdf.save(source)
+
+    index = index_page(source, 0)
+    line, other = index.runs
+    assert line.text == 'First line' and line.editable
+    assert len(line.glyphs) == 2 and line.glyphs[0].clipped
+    assert Edit.from_run(0, line).bounds() == line.bounds
+    for glyph in line.glyphs:
+        x0, y0, x1, y1 = glyph.bounds
+        x, y = (x0+x1)/2, (y0+y1)/2
+        assert index.area((x, y, x, y)) == [line]
+    before_text, before_boxes = char_boxes(source)
+    assert 'Next' in before_text
+
+    destination = tmp_path/'shared-out.pdf'
+    write_copy(source, destination, [replace(Edit.from_run(0, line), text='Longer line')])
+    replaced, unchanged = index_page(destination, 0).runs
+    assert replaced.text == 'Longer line'
+    assert replaced.placement == pytest.approx(line.placement)
+    assert replaced.glyphs[0].fill == line.glyphs[0].fill
+    assert replaced.glyphs[0].clipped
+    assert unchanged.text == 'Next' and unchanged.placement == other.placement
+    _, after_boxes = char_boxes(destination)
+    assert after_boxes[-4:] == before_boxes[-4:]
+    with q.Pdf.open(destination) as pdf:
+        assert len(streams(pdf.pages[0])) == 1
+
+
 def signed_pdf(path, kind):
     with q.Pdf.new() as pdf:
         page = pdf.add_blank_page(page_size=(300, 200))
