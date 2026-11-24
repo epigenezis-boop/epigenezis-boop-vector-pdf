@@ -34,7 +34,8 @@ class Canvas(QWidget):
         self.setMinimumSize(240, 180)
         self.sheet = None
         self.page = 0
-        self.zoom = 1.
+        self._zoom = 1.
+        self.fit_page = True
         self.rotation = 0
         self.pan = QPointF()
         self.cache = None
@@ -65,7 +66,16 @@ class Canvas(QWidget):
         except (TypeError, ValueError):
             return False
 
-    def set_sheet(self, page, sheet, fit=True):
+    @property
+    def zoom(self):
+        return self._zoom
+
+    @zoom.setter
+    def zoom(self, value):
+        self._zoom = value
+        self.fit_page = False
+
+    def set_sheet(self, page, sheet, fit=True, view_state=None):
         self.page, self.sheet = page, sheet
         self.cancel_move()
         self.drag = None
@@ -73,31 +83,22 @@ class Canvas(QWidget):
         self.move_enabled = False
         self.move_bounds = None
         if fit:
-            self.rotation = 0
+            self.restore_view(*(view_state or (None, 0)))
+        elif self.fit_page:
             self.fit()
         else:
             self.refresh()
 
     def view_state(self):
-        return self.zoom, self.rotation
+        return (None if self.fit_page else self.zoom), self.rotation
 
     def restore_view(self, zoom, rotation):
-        """Restore a per-page view and center the sheet in the viewport."""
-        if not self.sheet_valid():
-            self.zoom, self.pan = 1., QPointF()
-            self.zoomed.emit(self.zoom)
-            self.refresh()
+        self.rotation = rotation
+        if zoom is None:
+            self.fit()
             return
-        self.zoom = min(MAX_ZOOM, max(MIN_ZOOM, float(zoom)))
-        self.rotation = int(rotation) % 360
-        if self.rotation not in (0, 90, 180, 270):
-            self.rotation = 0
-        w, h = self.sheet.width, self.sheet.height
-        if self.rotation in (90, 270):
-            w, h = h, w
-        self.pan = QPointF((self.width()-w*self.zoom)/2, (self.height()-h*self.zoom)/2)
-        self.zoomed.emit(self.zoom)
-        self.refresh()
+        self.zoom = zoom
+        self.center_sheet()
 
     def transform(self):
         if not self.sheet_valid():
@@ -148,27 +149,36 @@ class Canvas(QWidget):
         self.demand.emit([k for k in needed if self.cache.peek(k) is None])
 
     def fit(self):
+        self.fit_page = True
         if self.sheet is None:
             return
-        if not self.sheet_valid():
-            self.zoom, self.pan = 1., QPointF()
-            self.zoomed.emit(self.zoom)
-            self.refresh()
-            return
+        if self.sheet_valid():
+            w, h = self.sheet_size()
+            available_w, available_h = max(20, self.width()-48), max(20, self.height()-48)
+            scale = min(available_w/w, available_h/h)
+            self._zoom = min(MAX_ZOOM, scale) if isfinite(scale) and scale > 0 else 1.
+        else:
+            self._zoom = 1.
+        self.center_sheet()
+
+    def sheet_size(self):
         w, h = self.sheet.width, self.sheet.height
-        if self.rotation in (90, 270):
-            w, h = h, w
-        available_w, available_h = max(20, self.width()-48), max(20, self.height()-48)
-        scale = min(available_w/w, available_h/h)
-        if not isfinite(scale) or scale <= 0:
-            scale = 1.
-        self.zoom = min(MAX_ZOOM, max(MIN_ZOOM, scale))
-        self.pan = QPointF((self.width()-w*self.zoom)/2, (self.height()-h*self.zoom)/2)
+        return (h, w) if self.rotation in (90, 270) else (w, h)
+
+    def center_sheet(self):
+        self.pan = QPointF()
+        if self.sheet_valid():
+            w, h = self.sheet_size()
+            self.pan = QPointF((self.width()-w*self.zoom)/2, (self.height()-h*self.zoom)/2)
         self.zoomed.emit(self.zoom)
         self.refresh()
 
     def rotate(self):
         if not self.sheet_valid():
+            return
+        if self.fit_page:
+            self.rotation = (self.rotation+90)%360
+            self.fit()
             return
         center = QPointF(self.rect().center())
         transform, invertible = self.transform().inverted()
@@ -188,7 +198,7 @@ class Canvas(QWidget):
         if not invertible:
             return
         world = transform.map(anchor)
-        self.zoom = min(MAX_ZOOM, max(MIN_ZOOM, self.zoom*multiplier))
+        self.zoom = min(MAX_ZOOM, max(min(MIN_ZOOM, self.zoom), self.zoom*multiplier))
         self.pan += anchor-self.transform().map(world)
         self.zoomed.emit(self.zoom)
         self.refresh()
@@ -252,7 +262,10 @@ class Canvas(QWidget):
             return
         self.coordinate.emit(self.document_point(event.position()))
         if self.drag and self.drag[0] == 'pan':
-            self.pan = self.drag[2]+event.position()-self.drag[1]
+            delta = event.position()-self.drag[1]
+            if not delta.isNull():
+                self.fit_page = False
+            self.pan = self.drag[2]+delta
             self.refresh()
         elif self.drag and self.drag[0] == 'move':
             if (delta := self.move_delta(event.position())) is not None:
@@ -320,7 +333,10 @@ class Canvas(QWidget):
         self.update()
 
     def resizeEvent(self, event):
-        self.refresh()
+        if self.fit_page and self.sheet is not None:
+            self.fit()
+        else:
+            self.refresh()
         super().resizeEvent(event)
 
     def showEvent(self, event):

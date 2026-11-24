@@ -4,7 +4,7 @@ from dataclasses import replace
 import faulthandler
 import logging
 from logging.handlers import RotatingFileHandler
-from math import hypot, isfinite
+from math import cos, hypot, isfinite, radians, sin
 import os
 from pathlib import Path
 import platform
@@ -14,15 +14,15 @@ from time import perf_counter, time
 from threading import Thread
 from weakref import ref
 
-from PySide6.QtCore import QObject, QPointF, QSettings, QSize, Qt, QTimer, QUrl, Signal, qInstallMessageHandler
+from PySide6.QtCore import QEvent, QObject, QPointF, QSettings, QSize, Qt, QTimer, QUrl, Signal, qInstallMessageHandler
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence,
     QPainter, QPalette, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QScrollArea, QSplitter, QTabWidget, QToolButton, QVBoxLayout,
+    QApplication, QBoxLayout, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QFrame, QHBoxLayout, QLabel, QLayout, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTabWidget, QToolButton, QVBoxLayout,
     QWidget, QColorDialog,
 )
 
@@ -30,7 +30,7 @@ from .canvas import Canvas, image_from_render
 from .document import (
     Document, LocalEditor, cleanup_temp_files, cleanup_workspaces, same_path, scan_recovery,
 )
-from .geometry import box
+from .geometry import box, compose, point
 from .palette import STRIPES, THEMES, stylesheet
 from .render import RenderEngine, TileCache
 from .fonts import ASSETS, FALLBACKS, import_font, learn_fonts
@@ -223,6 +223,38 @@ class Ribbon(QWidget):
         with QPainter(self) as painter:
             for i, color in enumerate(STRIPES):
                 painter.fillRect(0, i*3, self.width(), 3, QColor(color))
+
+
+class Toolbar(QWidget):
+    def __init__(self):
+        super().__init__(objectName='toolbar')
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.groups = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
+        self.groups.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        self.groups.setContentsMargins(15, 10, 12, 10)
+        self.groups.setSpacing(8)
+        self.files = QHBoxLayout()
+        self.tools = QHBoxLayout()
+        for group in (self.files, self.tools):
+            group.setSpacing(7)
+        self.groups.addLayout(self.files)
+        self.groups.addLayout(self.tools, 1)
+
+    def arrange(self):
+        margins = self.groups.contentsMargins()
+        width = (self.files.minimumSize().width() + self.tools.minimumSize().width()
+                 + margins.left() + margins.right() + self.groups.spacing())
+        direction = (QBoxLayout.Direction.LeftToRight if self.width() >= width
+                     else QBoxLayout.Direction.TopToBottom)
+        if self.groups.direction() != direction:
+            self.groups.setDirection(direction)
+            self.updateGeometry()
+
+    def event(self, event):
+        result = super().event(event)
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.LayoutRequest):
+            self.arrange()
+        return result
 
 
 class Language:
@@ -561,11 +593,7 @@ class Workspace(QWidget):
         self.clear_selection()
         self.matches.clear()
         self.matches.hide()
-        if number in self.view_states:
-            self.view.set_sheet(number, self.sheets[number], fit=False)
-            self.view.restore_view(*self.view_states[number])
-        else:
-            self.view.set_sheet(number, self.sheets[number], fit=True)
+        self.view.set_sheet(number, self.sheets[number], view_state=self.view_states.get(number))
         self.status()
         if number not in self.sheet_loaded:
             self.bridge.submit(self.render.executor, self.render.sheet,
@@ -586,12 +614,7 @@ class Workspace(QWidget):
             return
         if number == self.current and not self.busy:
             try:
-                if number in self.view_states:
-                    self.view.set_sheet(number, self.sheets[number], fit=False)
-                    self.view.restore_view(*self.view_states[number])
-                else:
-                    self.view.set_sheet(number, self.sheets[number], fit=True)
-                self.view.refresh()
+                self.view.set_sheet(number, self.sheets[number], fit=False)
             except (TypeError, ValueError, ZeroDivisionError):
                 LOG.exception('Could not apply the sheet geometry')
         self.status()
@@ -870,12 +893,12 @@ class Workspace(QWidget):
         if xy and runs:
             x, y = xy
             try:
-                choice = min(runs.values(), key=lambda edit: hypot(edit.x-x, edit.y-y))
+                choice = min(runs.values(), key=lambda edit: hit_distance(edit, x, y))
                 self.load_edit(choice)
             except Exception:
                 LOG.exception('Could not select the nearest text object')
                 self.clear_selection()
-                self.notice('This text object cannot be edited safely.',
+                self.notice('Этот текстовый объект нельзя безопасно редактировать.',
                             'This text object cannot be edited safely.')
         elif runs:
             self.matches.show()
@@ -910,7 +933,7 @@ class Workspace(QWidget):
             LOG.exception('The selected text has no usable bounds')
             self.selected = None
             self.clear_selection()
-            self.notice('This text object cannot be edited safely. ' + str(error),
+            self.notice('Этот текстовый объект нельзя безопасно редактировать. ' + str(error),
                         'This text object cannot be edited safely. ' + str(error))
             return False
         self.selected = edit
@@ -1539,6 +1562,22 @@ class Workspace(QWidget):
             self.document.cleanup()
 
 
+def hit_distance(edit, x, y):
+    left, bottom, right, top = edit.bounds()
+    outside = hypot(max(left-x, x-right, 0.), max(bottom-y, y-top, 0.))
+    angle = radians(edit.angle)
+    ux, uy = cos(angle), sin(angle)
+    dx, dy = x-edit.x, y-edit.y
+    baseline = abs(dx*uy - dy*ux)
+    if edit.original and edit.text == edit.original.text and edit.keeps_placement():
+        last = edit.original.glyphs[-1]
+        end_x, end_y = point(compose(last.ctm, last.matrix), last.advance, 0.)
+        length = (end_x-edit.x)*ux + (end_y-edit.y)*uy
+        along = dx*ux + dy*uy
+        baseline = hypot(baseline, max(-along, along-length, 0.))
+    return outside, baseline
+
+
 def intersects(a, b):
     return a[0] <= b[2] and a[2] >= b[0] and a[1] <= b[3] and a[3] >= b[1]
 
@@ -1593,10 +1632,8 @@ class MainWindow(QMainWindow):
         vertical.setContentsMargins(0, 0, 0, 0)
         vertical.setSpacing(0)
         self.setCentralWidget(root)
-        header = QWidget(objectName='toolbar')
-        row = QHBoxLayout(header)
-        row.setContentsMargins(15, 10, 12, 10)
-        row.setSpacing(7)
+        header = Toolbar()
+        row = header.files
         mark = QLabel()
         mark.setPixmap(self.windowIcon().pixmap(QSize(29, 29)))
         row.addWidget(mark)
@@ -1610,9 +1647,10 @@ class MainWindow(QMainWindow):
             ('redo', '↷', '↷', lambda: self.call('travel', 1), 'Ctrl+Y'),
         ]:
             self.button(row, name, ru, en, slot, shortcuts)
-        self.actions['undo'].setToolTip(self.lang.get('Отменить', 'Undo'))
-        self.actions['redo'].setToolTip(self.lang.get('Повторить', 'Redo'))
-        row.addSpacing(8)
+        self.lang.bind(self.actions['undo'].setToolTip, 'Отменить', 'Undo')
+        self.lang.bind(self.actions['redo'].setToolTip, 'Повторить', 'Redo')
+        row.addStretch()
+        row = header.tools
         self.mode_group = QActionGroup(self)
         self.mode_group.setExclusive(True)
         for name, ru, en in [('view', 'Просмотр', 'View'), ('text', 'Текст', 'Text'), ('region', 'Область', 'Area')]:
@@ -1629,16 +1667,8 @@ class MainWindow(QMainWindow):
             ('rotate', '↻', '↻', lambda: self.canvas('rotate')),
         ]:
             self.button(row, name, ru, en, fn)
-        self.actions['rotate'].setToolTip(self.lang.get('Повернуть вид на 90°', 'Rotate the view by 90°'))
-        self.toolbar_scroll = QScrollArea()
-        self.toolbar_scroll.setWidget(header)
-        self.toolbar_scroll.setWidgetResizable(False)
-        self.toolbar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.toolbar_scroll.setFixedHeight(75)
-        self.toolbar_scroll.viewport().setAutoFillBackground(False)
-        vertical.addWidget(self.toolbar_scroll)
+        self.lang.bind(self.actions['rotate'].setToolTip, 'Повернуть вид на 90°', 'Rotate the view by 90°')
+        vertical.addWidget(header)
         vertical.addWidget(Ribbon())
 
         self.tabs = QTabWidget(tabsClosable=True, movable=True)
@@ -1709,6 +1739,7 @@ class MainWindow(QMainWindow):
         self.actions[name] = action
         button = QToolButton()
         button.setDefaultAction(action)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         if name == 'open':
             button.setObjectName('primary')
         layout.addWidget(button)

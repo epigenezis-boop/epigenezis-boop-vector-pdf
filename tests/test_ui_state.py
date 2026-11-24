@@ -7,9 +7,9 @@ from types import SimpleNamespace
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 os.environ.setdefault('VECTORPDF_NO_RECOVERY', '1')
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QImage, QMouseEvent
-from PySide6.QtWidgets import QApplication, QFileDialog, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QListWidgetItem, QToolButton
 
 import pytest
 
@@ -445,6 +445,53 @@ def test_per_page_zoom_and_rotation_are_remembered(window, tmp_path):
     tab.page(1)
     assert tab.view.zoom == pytest.approx(1.5)
     assert tab.view.rotation == 180
+
+
+def test_toolbar_reflows_with_readable_russian_and_english_labels(window, app):
+    header = window.findChild(ui_module.Toolbar)
+    brand = header.findChild(QLabel, 'brand')
+    for width in (1320, 780, 1000):
+        window.resize(width, 820)
+        for language in ('ru', 'en'):
+            window.language(language)
+            app.processEvents()
+            assert header.width() == window.centralWidget().width()
+            for widget in [brand, *header.findChildren(QToolButton)]:
+                assert header.rect().contains(widget.geometry())
+                assert widget.width() >= widget.sizeHint().width()
+
+
+def test_fit_page_tracks_viewport_and_manual_zoom_survives_resize(window, app, tmp_path):
+    tab = make_tab(window, tmp_path)
+    canvas = tab.view
+    tab.sheets[1] = Sheet(842, 595, (0, 0, 842, 595), 0)
+
+    def assert_fitted():
+        page = canvas.transform().mapRect(QRectF(0, 0, canvas.sheet.width, canvas.sheet.height))
+        assert QRectF(canvas.rect()).contains(page)
+        assert page.center().x() == pytest.approx(canvas.width()/2)
+        assert page.center().y() == pytest.approx(canvas.height()/2)
+        assert page.width()/page.height() == pytest.approx(canvas.sheet.width/canvas.sheet.height)
+
+    app.processEvents()
+    assert_fitted()
+    initial = canvas.zoom
+    window.resize(1040, 630)
+    app.processEvents()
+    assert canvas.zoom < initial
+    assert_fitted()
+    canvas.zoom_at(2.)
+    manual = canvas.zoom
+    window.resize(1320, 900)
+    app.processEvents()
+    assert canvas.zoom == manual
+
+    tab.page(1)
+    assert_fitted()
+    tab.page(0)
+    assert canvas.zoom == manual
+    window.actions['fit'].trigger()
+    assert_fitted()
 
 
 def test_tile_order_fit_clamp_and_peek_stats(window):
