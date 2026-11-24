@@ -3,13 +3,14 @@ from dataclasses import dataclass
 from math import isfinite, radians, tan
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import zlib
 
 import pikepdf as q
 
 from .fonts import FALLBACKS, fallback
-from .geometry import box, compose, inverse, translate_angle, union
+from .geometry import box, compose, translate_angle, union
 from .object_index import SHOW, streams
 
 ITALIC_SHEAR = tan(radians(12))
@@ -34,24 +35,55 @@ class Edit:
         return cls(page, run.id, run.text, *run.placement, original=run)
 
     def native_codes(self):
-        if (not self.original or self.family != 'Original' or self.color is not None or
+        glyphs = self.original.glyphs if self.original else ()
+        if (not self.original or self.family != 'Original' or
                 abs(self.shear()-self.original.shear) > .001):
             return None
         if any(abs(a-b) > .001 for a, b in zip((self.x, self.y, self.size, self.angle), self.original.placement)):
             return None
-        if (len(self.text) != len(self.original.text) or self.original.spaces or
-                any(g.font_key != self.original.glyphs[0].font_key for g in self.original.glyphs)):
+        if len(glyphs) != 1 or self.original.spaces:
+            return None
+        if any(g.font_key != glyphs[0].font_key for g in glyphs):
+            return None
+        if self.color is not None:
+            fill = glyphs[0].fill
+            if fill is None or any(abs(a-b) > .002 for a, b in zip(self.color, fill)):
+                return None
+        if len(self.text) != len(self.original.text):
             return None
         result = []
         position = 0
-        for glyph in self.original.glyphs:
+        for glyph in glyphs:
             txt = self.text[position:position+len(glyph.text)]
             code = glyph.data if txt == glyph.text else self.original.font.encode(txt)
             if code is None:
                 return None
             result.append(code)
             position += len(glyph.text)
+        if sum(len(code) for code in result) != sum(len(glyph.data) for glyph in glyphs):
+            return None
         return result
+
+    def fill_color(self):
+        if self.color is not None:
+            return tuple(self.color)
+        if self.original and self.original.glyphs:
+            fill = self.original.glyphs[0].fill
+            if fill is not None:
+                return tuple(fill)
+        return (0., 0., 0.)
+
+    def glyph_supported(self):
+        if not self.text:
+            return True
+        try:
+            family = self.current_font()
+            if family == 'Original':
+                return bool(self.original and self.original.font.encode(self.text) is not None)
+            fallback(family, self.text)
+            return True
+        except Exception:
+            return False
 
     def current_font(self):
         if self.family in FALLBACKS:
@@ -79,6 +111,16 @@ class Edit:
         return translate_angle(self.x, self.y, self.angle, shear=self.shear())
 
     def bounds(self):
+        try:
+            result = self._bounds()
+            if all(isfinite(value) for value in result):
+                return result
+        except Exception:
+            pass
+        width = sum(.55 if char != ' ' else .28 for char in self.text)*self.size
+        return box(self.matrix(), (0., -.25*self.size, max(width, .1*self.size), .9*self.size))
+
+    def _bounds(self):
         if not self.text:
             return self.original.bounds if self.original else (self.x, self.y, self.x, self.y)
         codes = self.native_codes()
@@ -89,6 +131,8 @@ class Edit:
         family = self.current_font()
         if family == 'Original':
             font, data = self.original.font, self.original.font.encode(self.text)
+            if data is None:
+                raise ValueError('The original font cannot render this text.')
         else:
             font, data = fallback(family, self.text)
         horizontal = self.original.glyphs[0].horizontal if self.original else 1.
@@ -152,26 +196,130 @@ def text_operator(data):
 
 
 def new_run(edit, resource, data, matrix, font_size, added=False, horizontal=1.):
-    color = edit.color if edit.color is not None else ((0., 0., 0.) if added else None)
-    return (b'\nq\n' + (op(color, 'rg') if color is not None else b'') + b'BT\n'
+    color = edit.color if edit.color is not None else (edit.fill_color() if edit.original else (0., 0., 0.))
+    return (b'\nq\n' + op(color, 'rg') + b'BT\n'
             + resource.encode('ascii') + b' ' + op([font_size], 'Tf') +
             b'0 Tc 0 Tw '+op([horizontal*100], 'Tz')+b'0 Ts 0 Tr\n' + op(matrix, 'Tm') + text_operator(data) + b' Tj\nET\nQ\n')
+
+
+def _signature_value(obj):
+    if not isinstance(obj, (q.Dictionary, q.Stream)):
+        return False
+    try:
+        if '/ByteRange' in obj and '/Contents' in obj:
+            return True
+        if str(obj.get('/Type', '')) in ('/Sig', '/DocTimeStamp') and '/ByteRange' in obj:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _walk_signatures(obj, seen):
+    if not isinstance(obj, (q.Dictionary, q.Stream, q.Array)):
+        return False, False
+    try:
+        generation = obj.objgen
+    except Exception:
+        generation = (0, 0)
+    marker = generation if generation != (0, 0) else ('direct', id(obj))
+    if marker in seen:
+        return False, False
+    # Keep direct objects alive: their Python id can otherwise be reused and a
+    # later object would be skipped as already visited.
+    seen[marker] = obj
+    if isinstance(obj, q.Array):
+        signed = empty = False
+        for value in obj:
+            item_signed, item_empty = _walk_signatures(value, seen)
+            signed |= item_signed
+            empty |= item_empty
+        return signed, empty
+    if _signature_value(obj):
+        return True, False
+    signed = empty = False
+    try:
+        field_type = str(obj.get('/FT', ''))
+    except Exception:
+        field_type = ''
+    if field_type == '/Sig':
+        try:
+            value = obj.get('/V')
+        except Exception:
+            value = None
+        if value is None:
+            empty = True
+        else:
+            try:
+                if '/ByteRange' in value:
+                    signed = True
+                elif isinstance(value, (q.Dictionary, q.Stream)):
+                    empty = '/ByteRange' not in value
+                else:
+                    empty = True
+            except Exception:
+                empty = True
+    try:
+        perms = obj.get('/Perms')
+    except Exception:
+        perms = None
+    if isinstance(perms, (q.Dictionary, q.Stream)):
+        try:
+            if not perms:
+                empty = True
+        except Exception:
+            pass
+        try:
+            docmdp = perms.get('/DocMDP')
+            if docmdp is not None and '/ByteRange' in docmdp:
+                signed = True
+        except Exception:
+            pass
+    try:
+        values = list(obj.values())
+    except Exception:
+        values = []
+    for value in values:
+        try:
+            item_signed, item_empty = _walk_signatures(value, seen)
+        except Exception:
+            continue
+        signed |= item_signed
+        empty |= item_empty
+    return signed, empty
+
+
+def signature_state(pdf):
+    try:
+        signed, empty = _walk_signatures(pdf.Root, {})
+    except Exception:
+        return 'signed'
+    if signed:
+        return 'signed'
+    return 'empty' if empty else 'none'
+
+
+def has_signature(pdf):
+    return signature_state(pdf) == 'signed'
 
 
 def validate(pdf):
     if pdf.is_encrypted:
         raise ValueError('Editing encrypted PDFs is disabled.')
-    if '/Perms' in pdf.Root or any(isinstance(o, q.Dictionary) and
-        ('/ByteRange' in o or str(o.get('/FT', '')) == '/Sig') for o in pdf.objects):
+    if has_signature(pdf):
         raise ValueError('Editing can invalidate signatures. Signed PDFs are read-only.')
 
 
 def validate_edit(edit):
     if edit.original and not edit.original.editable:
         raise ValueError('This text object is read-only.')
-    if (len(edit.text) > 1500 or any(not c.isprintable() for c in edit.text)
-            or not .25 <= edit.size <= 4000 or not all(isfinite(x) for x in (edit.x, edit.y, edit.angle))):
-        raise ValueError('Use a single printable line of at most 1500 characters and a valid size.')
+    unchanged_text = edit.original is not None and edit.text == edit.original.text
+    unchanged_size = edit.original is not None and abs(edit.size-edit.original.placement[2]) < .0005
+    too_long = len(edit.text) > 100_000 and not unchanged_text
+    bad_size = not 0 < edit.size <= 5000 and not unchanged_size
+    if (too_long or any(not c.isprintable() for c in edit.text) or bad_size or
+            not all(isfinite(x) for x in (edit.x, edit.y, edit.angle))):
+        raise ValueError('Use a single printable line of at most 100000 characters and a size from 0 to 5000 points.')
     if edit.color is not None and (len(edit.color) != 3 or any(not 0 <= v <= 1 for v in edit.color)):
         raise ValueError('Invalid color.')
     if edit.family not in {*FALLBACKS, 'Original'}:
@@ -180,7 +328,10 @@ def validate_edit(edit):
 
 def bind_font(pdf, resource_fonts, family, edit):
     if family == 'Original':
-        return edit.original.glyphs[0].font_key, edit.original.font.encode(edit.text)
+        encoded = edit.original.font.encode(edit.text)
+        if encoded is None:
+            raise ValueError('The original font cannot render all characters.')
+        return edit.original.glyphs[0].font_key, encoded
     new_font, _, encoded = fallback(family, edit.text, pdf=pdf)
     token = 1
     while f'/VPFont{token}' in resource_fonts:
@@ -192,8 +343,17 @@ def bind_font(pdf, resource_fonts, family, edit):
 
 def rebuild(pdf, page, edits):
     content = streams(page)
-    resource_copy = q.Dictionary({str(k): v for k, v in page.Resources.items()})
-    resource_fonts = q.Dictionary({str(k): v for k, v in resource_copy.get('/Font', q.Dictionary()).items()})
+    try:
+        page_resources = page.Resources
+    except Exception:
+        page_resources = q.Dictionary()
+    if not isinstance(page_resources, q.Dictionary):
+        page_resources = q.Dictionary()
+    resource_copy = q.Dictionary({str(k): v for k, v in page_resources.items()})
+    font_object = resource_copy.get('/Font', q.Dictionary())
+    if not isinstance(font_object, q.Dictionary):
+        font_object = q.Dictionary()
+    resource_fonts = q.Dictionary({str(k): v for k, v in font_object.items()})
     resources_changed = False
     plan = defaultdict(list)
     added = []
@@ -209,35 +369,32 @@ def rebuild(pdf, page, edits):
             continue
         glyphs = edit.original.glyphs
         codes = edit.native_codes()
-        extra = None
-        if edit.text and codes is None:
-            family = edit.current_font()
-            resource, data = bind_font(pdf, resource_fonts, family, edit)
-            resources_changed |= family != 'Original'
-            first = glyphs[0]
-            matrix = compose(inverse(first.ctm), edit.matrix())
-            extra = new_run(edit, resource, data, matrix, edit.size, horizontal=first.horizontal)
-        for i, glyph in enumerate(glyphs):
-            code = codes[i] if codes is not None else b''
-            if code != glyph.data or (i == 0 and extra):
-                plan[glyph.stream].append((glyph, code, extra if i == 0 else None, glyphs if i == 0 and extra else ()))
+        if codes is not None:
+            for code, glyph in zip(codes, glyphs):
+                if code != glyph.data:
+                    plan[glyph.stream].append((glyph, code))
+            continue
+        # A replacement can move, resize or restyle the text. Clear every original
+        # show operand and append one self-contained run outside the original CTM.
+        for glyph in glyphs:
+            plan[glyph.stream].append((glyph, b''))
+        if not edit.text:
+            continue
+        family = edit.current_font()
+        resource, data = bind_font(pdf, resource_fonts, family, edit)
+        resources_changed |= family != 'Original'
+        first = glyphs[0]
+        added.append(new_run(edit, resource, data, edit.matrix(), edit.size, horizontal=first.horizontal))
     for index, jobs in plan.items():
         original = content[index]
         data = original.read_bytes()
-        offsets = Offsets([g.ordinal for g, _, _, _ in jobs])
+        offsets = Offsets([g.ordinal for g, _ in jobs])
         q.Object._parse_stream(original, offsets)
         changes = []
-        for glyph, code, addition, group in jobs:
+        for glyph, code in jobs:
             location = offsets.output.get(glyph.ordinal)
             if not location or location.data != glyph.data or location.after is None:
                 raise ValueError('Text offsets changed. Reopen the source document.')
-            if addition:
-                # Consolidating a split run preserves order only if other paint operators
-                # are absent between the text objects and the marked-content context agrees.
-                for left, right in zip(group, group[1:]):
-                    gap = data[offsets.output[left.ordinal].after:offsets.output[right.ordinal].position]
-                    verify_gap(gap)
-                changes.append((location.after, location.after, addition))
             changes.append((location.position, location.end, text_operator(code)))
         patched = splice(data, changes)
         if patched != data:
@@ -302,28 +459,181 @@ def file_stamp(path):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
-def write_copy(source, destination, edits, stamp=None):
+def _inherited(page, key):
+    obj = page.obj
+    seen = set()
+    while obj is not None:
+        try:
+            generation = obj.objgen
+        except Exception:
+            generation = (0, 0)
+        marker = generation if generation != (0, 0) else id(obj)
+        if marker in seen:
+            break
+        seen.add(marker)
+        try:
+            if key in obj:
+                return obj.get(key)
+        except Exception:
+            return None
+        try:
+            obj = obj.get('/Parent')
+        except Exception:
+            return None
+    return None
+
+
+def _rectangle_value(value):
+    try:
+        values = tuple(float(item) for item in value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if len(values) != 4 or any(not isfinite(item) for item in values):
+        return None
+    return values
+
+
+def _page_geometry(page):
+    media = _rectangle_value(_inherited(page, '/MediaBox'))
+    crop = _rectangle_value(_inherited(page, '/CropBox'))
+    try:
+        rotate = int(_inherited(page, '/Rotate') or 0) % 360
+    except (TypeError, ValueError, OverflowError):
+        rotate = 0
+    return media, crop, rotate
+
+
+def _raw_streams(page):
+    try:
+        return [stream.read_raw_bytes() for stream in streams(page)]
+    except Exception:
+        return None
+
+
+def _normalized_text(value):
+    return ''.join(value.split())
+
+
+def _pdfium_text(document, number):
+    page = document[number]
+    try:
+        textpage = page.get_textpage()
+        try:
+            return textpage.get_text_bounded()
+        finally:
+            textpage.close()
+    finally:
+        page.close()
+
+
+def _validate_output(path, geometry, untouched, expected):
+    try:
+        with q.Pdf.open(path, attempt_recovery=False) as output:
+            if has_signature(output):
+                raise ValueError('The saved PDF would still contain a signature.')
+            problems = [problem for problem in output.check_pdf_syntax()
+                        if not str(problem).startswith('WARNING')]
+            if problems:
+                raise ValueError('The saved PDF failed structural validation: ' + '; '.join(map(str, problems[:3])))
+            if len(output.pages) != len(geometry):
+                raise ValueError('The saved PDF changed the page count.')
+            for number, expected_geometry in enumerate(geometry):
+                page = output.pages[number]
+                if _page_geometry(page) != expected_geometry:
+                    raise ValueError(f'The saved PDF changed the page {number+1} box or rotation.')
+                if number in untouched:
+                    before, after = untouched[number], _raw_streams(page)
+                    if before is not None and after is not None and before != after:
+                        raise ValueError(f'The saved PDF changed untouched content on page {number+1}.')
+        if expected:
+            import pypdfium2 as pdfium
+            with pdfium.PdfDocument(str(path)) as document:
+                for number, texts in expected.items():
+                    actual = _normalized_text(_pdfium_text(document, number))
+                    for text in texts:
+                        needle = _normalized_text(text)
+                        if needle and needle not in actual:
+                            raise ValueError(f'Edited text is not present in the saved page {number+1}.')
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(f'The saved PDF failed validation: {error}') from error
+
+
+def _check_output(path):
+    try:
+        with q.Pdf.open(path, attempt_recovery=False) as output:
+            if has_signature(output):
+                raise ValueError('The saved PDF would still contain a signature.')
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(f'The saved PDF could not be reopened: {error}') from error
+
+
+def _same_file(first, second):
+    first, second = Path(first), Path(second)
+    try:
+        if first.resolve() == second.resolve():
+            return True
+    except OSError:
+        pass
+    try:
+        return first.exists() and second.exists() and os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def write_copy(source, destination, edits, stamp=None, original_source=None, verify=True):
     source, destination = Path(source), Path(destination)
-    if source.resolve() == destination.resolve() or (destination.exists() and os.path.samefile(source, destination)):
+    if _same_file(source, destination):
         raise ValueError('Choose a separate destination PDF.')
+    if original_source is not None and _same_file(original_source, destination):
+        raise ValueError('Choose a destination other than the original source PDF.')
+    if destination.exists() and not destination.is_file():
+        raise ValueError('The destination must be a PDF file.')
     if stamp is not None and file_stamp(source) != stamp:
         raise ValueError('The source file has changed on disk.')
+    edits = list(edits)
     fd, tmp = tempfile.mkstemp(suffix='.pdf', prefix='.vector-', dir=destination.parent)
     os.close(fd)
-    by_page = defaultdict(list)
-    for edit in edits:
-        by_page[edit.page].append(edit)
     try:
         with q.Pdf.open(source, attempt_recovery=False) as pdf:
             validate(pdf)
+            by_page = defaultdict(list)
+            for edit in edits:
+                if not 0 <= edit.page < len(pdf.pages):
+                    raise ValueError('The edit refers to a page outside this PDF.')
+                by_page[edit.page].append(edit)
+            geometry = [_page_geometry(page) for page in pdf.pages]
+            untouched = {number: _raw_streams(page) for number, page in enumerate(pdf.pages)
+                         if number not in by_page}
             for number, changes in by_page.items():
                 rebuild(pdf, pdf.pages[number], changes)
             pdf.save(tmp, normalize_content=False, compress_streams=False, recompress_flate=False,
                      stream_decode_level=q.StreamDecodeLevel.none, fix_metadata_version=False)
         if stamp is not None and file_stamp(source) != stamp:
             raise ValueError('The source file changed while saving.')
+        if verify:
+            expected = defaultdict(list)
+            for edit in edits:
+                if edit.text and edit.text.strip():
+                    expected[edit.page].append(edit.text)
+            _validate_output(tmp, geometry, untouched, expected)
+        else:
+            _check_output(tmp)
+        if stamp is not None and file_stamp(source) != stamp:
+            raise ValueError('The source file changed while saving.')
         with open(tmp, 'rb+') as handle:
             os.fsync(handle.fileno())
+        if destination.exists():
+            backup = Path(str(destination)+'.bak')
+            if _same_file(backup, source) or (original_source is not None and _same_file(backup, original_source)):
+                raise ValueError('The backup path would overwrite the source PDF.')
+            try:
+                shutil.copyfile(destination, backup)
+            except OSError as error:
+                raise ValueError(f'Could not create the backup copy: {error}') from error
         os.replace(tmp, destination)
     finally:
         Path(tmp).unlink(missing_ok=True)
