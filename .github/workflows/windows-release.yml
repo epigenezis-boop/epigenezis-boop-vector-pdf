@@ -1,0 +1,74 @@
+name: Windows release
+on:
+  push:
+    branches: [main]
+    paths: [vector_pdf/version.py, .github/workflows/windows-release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vector-pdf-windows-release
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Test editor and updater
+        run: |
+          python -m pip install -r requirements-test.txt
+          python -m pytest -q
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          $version = python -c "from vector_pdf.version import VERSION; print(VERSION)"
+          "VECTOR_VERSION=$version" >> $env:GITHUB_ENV
+          mkdir release, wheels
+          python -m pip download --platform win_amd64 --implementation cp --python-version 3.12 --abi cp312 --only-binary=:all: -r requirements.txt -d wheels
+          curl.exe --fail --location --output python-embed.zip https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip
+          $vswhere = Join-Path "${env:ProgramFiles(x86)}" 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dev = Join-Path $install 'Common7\Tools\VsDevCmd.bat'
+          @"
+          @call "$dev" -arch=x64 -host_arch=x64
+          @if errorlevel 1 exit /b 1
+          @cl /nologo /GS- /O2 /c tools\launcher_windows.c
+          @if errorlevel 1 exit /b 1
+          @rc /nologo /fo launcher_windows.res tools\launcher_windows.rc
+          @if errorlevel 1 exit /b 1
+          @link /nologo /subsystem:windows /entry:start /nodefaultlib /out:VectorPDF.exe launcher_windows.obj launcher_windows.res kernel32.lib user32.lib shell32.lib
+          "@ | Set-Content -Encoding Ascii build-launcher.cmd
+          cmd.exe /c build-launcher.cmd
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $file = "VECTOR-PDF-$version-win-x64.zip"
+          python tools/package_windows.py python-embed.zip wheels VectorPDF.exe "release/$file"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash "release/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $file" | Set-Content -Encoding Ascii "release/$file.sha256"
+          Expand-Archive "release/$file" -DestinationPath smoke
+          & 'smoke/Vector PDF/runtime/python.exe' -c "from PySide6.QtWidgets import QApplication; from vector_pdf.ui import MainWindow; app=QApplication([]); w=MainWindow(); w.show(); app.processEvents(); w.close()"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Publish complete stable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:VECTOR_VERSION"
+          $file = "VECTOR-PDF-$env:VECTOR_VERSION-win-x64.zip"
+          $draft = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft 2>$null
+          if ($LASTEXITCODE -eq 0 -and $draft -eq 'false') { exit 0 }
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --draft --title "VECTOR PDF $env:VECTOR_VERSION" --generate-notes
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          gh release upload $tag "release/$file" "release/$file.sha256" --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
