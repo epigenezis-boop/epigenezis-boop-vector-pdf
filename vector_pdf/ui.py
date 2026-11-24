@@ -1,29 +1,217 @@
+from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import replace
-from math import hypot
+import faulthandler
+import logging
+from logging.handlers import RotatingFileHandler
+from math import hypot, isfinite
+import os
 from pathlib import Path
+import platform
+from tempfile import mkstemp
 import sys
-from time import perf_counter
+from time import perf_counter, time
 from threading import Thread
 from weakref import ref
 
-from PySide6.QtCore import QObject, QPointF, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPalette, QPixmap
+from PySide6.QtCore import QObject, QPointF, QSettings, QSize, Qt, QTimer, QUrl, Signal, qInstallMessageHandler
+from PySide6.QtGui import (
+    QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence,
+    QPainter, QPalette, QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QSplitter, QTabWidget, QToolButton, QVBoxLayout, QWidget,
-    QColorDialog,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPushButton, QScrollArea, QSplitter, QTabWidget, QToolButton, QVBoxLayout,
+    QWidget, QColorDialog,
 )
 
 from .canvas import Canvas, image_from_render
-from .document import Document, LocalEditor
-from .geometry import box, union
+from .document import (
+    Document, LocalEditor, cleanup_temp_files, cleanup_workspaces, same_path, scan_recovery,
+)
+from .geometry import box
 from .palette import STRIPES, THEMES, stylesheet
 from .render import RenderEngine, TileCache
-from .fonts import ASSETS, import_font, learn_fonts
-from .writer import Edit, FALLBACKS, file_stamp
+from .fonts import ASSETS, FALLBACKS, import_font, learn_fonts
+from .version import REPOSITORY, VERSION
+from .writer import Edit, file_stamp
 from . import updater
+
+LOG = logging.getLogger(__name__)
+MAX_TEXT_LENGTH = 100_000
+MIN_TEXT_LENGTH = 1_500
+THUMBNAIL_BUDGET = 80
+INACTIVE_TILE_BUDGET = 32*1024**2
+APP_ICON = ASSETS / 'vector-pdf.png'
+_LOG_HANDLE = None
+_FAULT_HANDLE = None
+
+
+def safe_mode():
+    return os.environ.get('VECTORPDF_SAFE_MODE', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def log_directory():
+    base = os.environ.get('LOCALAPPDATA')
+    if base:
+        return Path(base) / 'VectorPDF' / 'logs'
+    return Path.home() / '.local' / 'share' / 'vector-pdf' / 'logs'
+
+
+def setup_logging():
+    """Install a rotating application log once; never let logging break startup."""
+    global _LOG_HANDLE
+    if _LOG_HANDLE is not None:
+        return Path(_LOG_HANDLE.name)
+    try:
+        directory = log_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / 'vector-pdf.log'
+        handler = RotatingFileHandler(path, maxBytes=2*1024**2, backupCount=3, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        _LOG_HANDLE = handler.stream
+        try:
+            global _FAULT_HANDLE
+            _FAULT_HANDLE = open(directory / 'faulthandler.log', 'a', encoding='utf-8')
+            faulthandler.enable(_FAULT_HANDLE)
+        except Exception:
+            pass
+        return path
+    except Exception:
+        return None
+
+
+def install_exception_hooks():
+    previous = sys.excepthook
+
+    def hook(kind, value, traceback):
+        try:
+            LOG.critical('Uncaught exception', exc_info=(kind, value, traceback))
+        except Exception:
+            pass
+        previous(kind, value, traceback)
+
+    sys.excepthook = hook
+
+    def thread_hook(args):
+        try:
+            LOG.critical('Uncaught thread exception in %s',
+                         getattr(args.thread, 'name', '?'),
+                         exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+        except Exception:
+            pass
+
+    try:
+        import threading
+        threading.excepthook = thread_hook
+    except (ImportError, AttributeError):
+        pass
+
+    def qt_handler(mode, context, message):
+        try:
+            from PySide6.QtCore import QtMsgType
+            level = logging.WARNING if mode != QtMsgType.QtInfoMsg else logging.INFO
+            logging.getLogger('qt').log(level, '%s', message)
+        except Exception:
+            pass
+
+    try:
+        qInstallMessageHandler(qt_handler)
+    except Exception:
+        pass
+
+
+def component_versions():
+    values = {
+        'VECTOR PDF': VERSION,
+        'Python': platform.python_version(),
+        'Qt': '—',
+        'PySide6': '—',
+        'PDFium': '—',
+        'QPDF': '—',
+        'pikepdf': '—',
+        'Platform': platform.platform(),
+        'Build': 'portable' if getattr(sys, 'frozen', False) else 'source',
+    }
+    try:
+        from PySide6 import QtCore, __version__ as pyside_version
+        values['Qt'] = QtCore.qVersion()
+        values['PySide6'] = pyside_version
+    except Exception:
+        pass
+    try:
+        import pypdfium2.version as pdfium_version
+        values['PDFium'] = str(pdfium_version.PDFIUM_INFO)
+    except Exception:
+        pass
+    try:
+        import pikepdf
+        values['pikepdf'] = pikepdf.__version__
+        values['QPDF'] = getattr(pikepdf, '__libqpdf_version__', '—')
+    except Exception:
+        pass
+    return values
+
+
+def about_text():
+    lines = ['VECTOR PDF', '']
+    lines.extend(f'{name}: {value}' for name, value in component_versions().items())
+    lines.extend([
+        '',
+        'Application license: MIT.',
+        'Qt/PySide6: LGPL/GPL. PDFium: Apache/BSD. QPDF: Apache-2.0.',
+        'pikepdf: MPL-2.0. fontTools: MIT. DejaVu fonts: Bitstream Vera license.',
+        '',
+        f'Project: https://github.com/{REPOSITORY}',
+        'MIT license: https://opensource.org/licenses/MIT',
+        'Qt LGPL: https://www.qt.io/licensing/open-source-lgpl-obligations',
+        f'Third-party overview: https://github.com/{REPOSITORY}/blob/main/THIRD_PARTY.md',
+        'License overview: THIRD_PARTY.md in the application folder.',
+        f'Logs: {log_directory()}',
+    ])
+    return '\n'.join(lines)
+
+
+def pdf_target(path):
+    """Append .pdf instead of replacing an unrelated suffix."""
+    target = Path(path)
+    if target.suffix.lower() != '.pdf':
+        target = target.with_name(target.name + '.pdf')
+    return target
+
+
+def friendly_error(error):
+    if isinstance(error, FileNotFoundError):
+        return 'The file is no longer available. It may have been moved or deleted.'
+    if isinstance(error, PermissionError):
+        return 'Windows denied access to the file. Close any program that uses it and try again.'
+    if isinstance(error, ValueError):
+        return str(error).strip() or 'The operation was rejected.'
+    winerror = getattr(error, 'winerror', None)
+    if winerror in (5, 32):
+        return 'The file is in use by another program. Close it and try again.'
+    text = str(error).strip()
+    return text or 'The operation could not be completed.'
+
+
+def write_ready_token(path):
+    """Atomically write the version/PID readiness token used by the updater."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = mkstemp(prefix='.ready-', suffix='.txt', dir=destination.parent)
+    os.close(fd)
+    try:
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            handle.write(f'version={VERSION}\npid={os.getpid()}\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 class Ribbon(QWidget):
@@ -67,18 +255,33 @@ class Language:
 class Bridge(QObject):
     complete = Signal(object, object)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.complete.connect(self.finish, Qt.ConnectionType.QueuedConnection)
 
     def submit(self, executor, fn, done, *args):
         future = executor.submit(fn, *args)
-        future.add_done_callback(lambda result: self.complete.emit(done, result))
+
+        def completed(result):
+            try:
+                self.complete.emit(done, result)
+            except RuntimeError:
+                pass
+
+        future.add_done_callback(completed)
         return future
 
     def finish(self, callback, future):
-        if not future.cancelled():
-            callback(future)
+        try:
+            if not future.cancelled():
+                callback(future)
+        except Exception:
+            # A Python exception in a Qt slot must never escape into Qt.  Log it and
+            # let the workspace's own try/finally protect busy flags.
+            try:
+                LOG.exception('Unhandled exception in an asynchronous UI callback')
+            except Exception:
+                pass
 
 
 class Workspace(QWidget):
@@ -107,6 +310,14 @@ class Workspace(QWidget):
         self.tiles = []
         self.thumb_jobs = {}
         self.thumb_rev = {}
+        self.thumb_icons = OrderedDict()
+        self.thumb_attempts = {}
+        self.thumb_retry_after = {}
+        self.view_states = {}
+        self.job_token = 0
+        self.save_token = 0
+        self.pending_action = None
+        self.export_name = None
         self.view = Canvas()
         self.view.cache = TileCache()
         self.view.surface = window.surface
@@ -143,6 +354,8 @@ class Workspace(QWidget):
         self.note = QLabel()
         self.note.setObjectName('panelNote')
         self.note.setWordWrap(True)
+        self.note.setTextFormat(Qt.TextFormat.PlainText)
+        self.note.setOpenExternalLinks(False)
         rl.addWidget(self.note)
         self.matches = QListWidget()
         self.matches.setMaximumHeight(126)
@@ -154,14 +367,15 @@ class Workspace(QWidget):
         fields = QFormLayout(self.form)
         fields.setContentsMargins(0, 2, 0, 0)
         self.text = QLineEdit()
-        self.text.setMaxLength(1500)
+        self.text.setMaxLength(MAX_TEXT_LENGTH)
         self.text.textChanged.connect(self.preview)
         self.text.returnPressed.connect(self.apply)
+        self.text.setPlaceholderText('')
         self.family = QComboBox()
         for family in ('Original', *FALLBACKS):
             self.family.addItem(family, family)
         self.family.currentIndexChanged.connect(self.preview)
-        self.size = self.spin(.25, 4000, ' pt')
+        self.size = self.spin(.01, 5000, ' pt')
         self.angle = self.spin(-360, 360, '°')
         self.italic = QCheckBox()
         self.lang.bind(self.italic.setText, 'Наклонный шрифт', 'Italic')
@@ -179,6 +393,8 @@ class Workspace(QWidget):
         self.font_notice = QLabel()
         self.font_notice.setWordWrap(True)
         self.font_notice.setObjectName('panelNote')
+        self.font_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.font_notice.setOpenExternalLinks(False)
         fields.addRow(self.font_notice)
         row = QHBoxLayout()
         self.apply_button = QPushButton(objectName='primary')
@@ -192,11 +408,17 @@ class Workspace(QWidget):
         fields.addRow(row)
         rl.addWidget(self.form)
         rl.addStretch()
-        self.splitter.addWidget(self.right)
-        self.left.setMinimumWidth(155)
-        self.right.setMinimumWidth(270)
+        self.right_scroll = QScrollArea()
+        self.right_scroll.setWidget(self.right)
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_scroll.setMinimumWidth(200)
+        self.splitter.addWidget(self.right_scroll)
+        self.left.setMinimumWidth(120)
+        self.right.setMinimumWidth(200)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([178, 810, 285])
+        self.splitter.setSizes([155, 810, 285])
         self.clear_selection()
         self.notice('Открытие PDF…', 'Opening PDF…')
 
@@ -212,28 +434,42 @@ class Workspace(QWidget):
     def spin(self, lower, upper, suffix):
         widget = QDoubleSpinBox()
         widget.setRange(lower, upper)
-        widget.setDecimals(3)
+        widget.setDecimals(4)
         widget.setSuffix(suffix)
         widget.valueChanged.connect(self.preview)
         return widget
 
     def start(self):
-        self.document.stamp = file_stamp(self.document.source)
-        self.bridge.submit(self.render.executor, self.render.open, self.opened,
-                           self.document.key, self.document.source)
+        try:
+            if self.document.stamp is None:
+                self.document.stamp = file_stamp(self.document.source)
+        except OSError as error:
+            self.window.error(error)
+            return False
+
+        def open_snapshot():
+            return self.render.open(self.document.key, self.document.ensure_basis())
+
+        self.bridge.submit(self.render.executor, open_snapshot, self.opened)
         self.bridge.submit(self.editor.executor, self.editor.check, self.permissions, self.document)
+        return True
 
     def permissions(self, task):
         if self.closed:
             return
         self.permission_checked = True
         try:
-            task.result()
-        except Exception as error:
-            self.read_only = True
-            self.view.set_mode('view')
-            self.notice('Только просмотр. '+str(error), 'Read-only. '+str(error))
-        self.status()
+            try:
+                task.result()
+            except Exception as error:
+                self.read_only = True
+                self.view.set_mode('view')
+                self.notice('Только просмотр. '+str(error), 'Read-only. '+str(error))
+            self.status()
+            self.window.sync_mode(self)
+            self.window.update_actions()
+        finally:
+            QTimer.singleShot(0, self.queue_thumbnails)
 
     def opened(self, task):
         if self.closed:
@@ -247,16 +483,20 @@ class Workspace(QWidget):
         self.document.metrics.opened = elapsed
         self.sheet_loaded.add(0)
         self.pages.blockSignals(True)
-        for i, sheet in enumerate(self.sheets, 1):
-            item = QListWidgetItem(f'{i}   ·   {format_name(sheet)}')
-            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-            self.pages.addItem(item)
-        self.pages.setCurrentRow(0)
-        self.pages.blockSignals(False)
+        try:
+            for i, sheet in enumerate(self.sheets, 1):
+                item = QListWidgetItem(f'{i}   ·   {format_name(sheet)}')
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+                self.pages.addItem(item)
+            self.pages.setCurrentRow(0)
+        finally:
+            self.pages.blockSignals(False)
+        self.view_states.clear()
         self.view.set_sheet(0, self.sheets[0])
         if not self.read_only:
             self.notice('Выберите «Текст» или «Область», чтобы начать правку.',
                         'Choose Text or Area to begin editing.')
+        self.window.sync_mode(self)
         self.status()
         self.view.refresh()
         QTimer.singleShot(550, self.queue_thumbnails)
@@ -268,15 +508,64 @@ class Workspace(QWidget):
         self.xy = xy
         self.status()
 
+    def set_busy(self, flag):
+        self.busy = bool(flag)
+        try:
+            self.pages.setEnabled(not self.busy)
+        except RuntimeError:
+            pass
+        self.window.update_actions()
+        if not self.busy:
+            QTimer.singleShot(0, self.queue_thumbnails)
+
     def page(self, number):
-        if self.closed or number < 0 or number == self.current:
+        if self.closed or number < 0 or number >= len(self.sheets):
             return
+        if self.busy:
+            self._restore_page_row()
+            return
+        if number == self.current:
+            return
+        if self.has_draft():
+            self._restore_page_row()
+            self.resolve_draft(lambda: self._switch_page(number), self._restore_page_row)
+            return
+        self._switch_page(number)
+
+    def _restore_page_row(self):
+        if self.closed:
+            return
+        try:
+            blocked = self.pages.blockSignals(True)
+            self.pages.setCurrentRow(self.current)
+            self.pages.blockSignals(blocked)
+        except RuntimeError:
+            pass
+
+    def _switch_page(self, number):
+        if self.closed or self.busy or number < 0 or number >= len(self.sheets) or number == self.current:
+            return
+        if 0 <= self.current < len(self.sheets):
+            self.view_states[self.current] = self.view.view_state()
         self.current = number
+        try:
+            if self.pages.currentRow() != number:
+                blocked = self.pages.blockSignals(True)
+                self.pages.setCurrentRow(number)
+                self.pages.blockSignals(blocked)
+        except RuntimeError:
+            pass
         self.tiles.clear()
         self.active_area = self.pending_area = None
         self.xy = None
         self.clear_selection()
-        self.view.set_sheet(number, self.sheets[number])
+        self.matches.clear()
+        self.matches.hide()
+        if number in self.view_states:
+            self.view.set_sheet(number, self.sheets[number], fit=False)
+            self.view.restore_view(*self.view_states[number])
+        else:
+            self.view.set_sheet(number, self.sheets[number], fit=True)
         self.status()
         if number not in self.sheet_loaded:
             self.bridge.submit(self.render.executor, self.render.sheet,
@@ -291,19 +580,37 @@ class Workspace(QWidget):
             self.sheets[number] = task.result()
             self.sheet_loaded.add(number)
         except Exception as error:
-            self.notice(str(error))
+            if number == self.current:
+                self.notice(str(error))
+            self.status()
             return
-        if number == self.current:
-            self.view.set_sheet(number, self.sheets[number], fit=False)
-            self.view.refresh()
+        if number == self.current and not self.busy:
+            try:
+                if number in self.view_states:
+                    self.view.set_sheet(number, self.sheets[number], fit=False)
+                    self.view.restore_view(*self.view_states[number])
+                else:
+                    self.view.set_sheet(number, self.sheets[number], fit=True)
+                self.view.refresh()
+            except (TypeError, ValueError, ZeroDivisionError):
+                LOG.exception('Could not apply the sheet geometry')
+        self.status()
+        QTimer.singleShot(0, self.queue_thumbnails)
 
     def queue_thumbnails(self):
         if (self.closed or self.busy or not self.left.isVisible() or not self.sheets
-                or self.tile_job or self.thumb_jobs):
+                or self.tile_job or self.thumb_jobs or not self.pages.count()):
             return
-        visible = [i for i in range(len(self.sheets)) if
-                   self.pages.visualItemRect(self.pages.item(i)).intersects(self.pages.viewport().rect())]
-        number = next((i for i in visible if i not in self.thumb_rev), None)
+        try:
+            viewport = self.pages.viewport().rect()
+            visible = [i for i in range(min(len(self.sheets), self.pages.count()))
+                       if self.pages.item(i) is not None
+                       and self.pages.visualItemRect(self.pages.item(i)).intersects(viewport)]
+        except RuntimeError:
+            return
+        now = time()
+        number = next((i for i in visible if i not in self.thumb_rev
+                       and now >= self.thumb_retry_after.get(i, 0)), None)
         if number is None:
             return
         key = self.document.key
@@ -311,23 +618,54 @@ class Workspace(QWidget):
             lambda task: self.thumbnail_done(number, key, task), key, number)
 
     def thumbnail_done(self, number, key, task):
-        self.thumb_jobs.pop(number, None)
-        if self.closed:
-            return
         try:
-            data = task.result()
-            if data and self.document.key == key:
+            self.thumb_jobs.pop(number, None)
+            if self.closed:
+                return
+            try:
+                data = task.result()
+                if not data or self.document.key != key:
+                    raise ValueError('empty thumbnail')
                 pixmap = QPixmap.fromImage(image_from_render(data))
                 icon = QIcon(pixmap)
                 icon.addPixmap(pixmap, QIcon.Mode.Selected)
-                self.pages.item(number).setIcon(icon)
+                if self.pages.item(number) is not None:
+                    self._store_thumbnail(number, icon)
                 self.thumb_rev[number] = key
-        except Exception:
-            self.thumb_rev[number] = key
-        if self.tiles:
-            self.next_tile()
-        else:
-            QTimer.singleShot(30, self.queue_thumbnails)
+                self.thumb_attempts.pop(number, None)
+                self.thumb_retry_after.pop(number, None)
+            except Exception:
+                attempts = self.thumb_attempts.get(number, 0)+1
+                self.thumb_attempts[number] = attempts
+                if attempts >= 2:
+                    self.thumb_rev[number] = key
+                else:
+                    self.thumb_retry_after[number] = time()+.7
+                    QTimer.singleShot(750, self.queue_thumbnails)
+            if self.tiles:
+                self.next_tile()
+            else:
+                QTimer.singleShot(30, self.queue_thumbnails)
+        finally:
+            if number in self.thumb_jobs:
+                self.thumb_jobs.pop(number, None)
+
+    def _store_thumbnail(self, number, icon):
+        self.thumb_icons[number] = icon
+        self.thumb_icons.move_to_end(number)
+        self.pages.item(number).setIcon(icon)
+        while len(self.thumb_icons) > THUMBNAIL_BUDGET:
+            for candidate in list(self.thumb_icons):
+                if candidate == self.current:
+                    continue
+                self.thumb_icons.pop(candidate, None)
+                self.thumb_rev.pop(candidate, None)
+                item = self.pages.item(candidate)
+                if item is not None:
+                    item.setIcon(QIcon())
+                break
+            else:
+                break
 
     def demand(self, tiles):
         if self.closed:
@@ -342,8 +680,10 @@ class Workspace(QWidget):
             return
         while self.tiles:
             key = self.tiles.pop(0)
-            if key in self.view.cache:
+            if self.view.cache.peek(key) is not None:
+                self.view.cache.hits += 1
                 continue
+            self.view.cache.misses += 1
             source = self.document.key
             self.tile_key = key
             self.tile_job = self.bridge.submit(self.render.executor, self.render.render,
@@ -352,19 +692,22 @@ class Workspace(QWidget):
         QTimer.singleShot(135, self.queue_thumbnails)
 
     def tile_done(self, source, key, task):
-        self.tile_job, self.tile_key = None, None
-        if self.closed:
-            return
         try:
-            data = task.result()
-            if data and self.document.key == source:
-                self.document.metrics.render = data[-1]
-                self.view.cache.put(key, image_from_render(data))
-                if key.page == self.current:
-                    self.view.update()
-        except Exception as error:
-            self.notice(str(error))
-        self.next_tile()
+            self.tile_job, self.tile_key = None, None
+            if self.closed:
+                return
+            try:
+                data = task.result()
+                if data and self.document.key == source:
+                    self.document.metrics.render = data[-1]
+                    self.view.cache.put(key, image_from_render(data))
+                    if key.page == self.current:
+                        self.view.update()
+            except Exception as error:
+                self.notice(str(error))
+        finally:
+            self.tile_job, self.tile_key = None, None
+            self.next_tile()
 
     def notice(self, ru, en=None):
         self.note.setText(self.lang.get(ru, en or ru))
@@ -381,17 +724,81 @@ class Workspace(QWidget):
         self.matches.hide()
         self.results.clear()
 
-    def set_mode(self, mode):
+    def current_draft(self):
+        if self.selected is None or self.busy or not self.form.isEnabled():
+            return None
+        try:
+            edit = self.read_fields()
+        except Exception:
+            LOG.exception('Could not read the property draft')
+            return None
+        return edit if edit is not None and edit != self.selected else None
+
+    def has_draft(self):
+        return self.current_draft() is not None
+
+    def resolve_draft(self, action, canceled=None):
+        """Ask before throwing away text that is still only in the form."""
+        if not self.has_draft():
+            action()
+            return True
+        answer = self.window.ask(
+            self.lang.get('Несохранённые изменения', 'Unapplied change'),
+            self.lang.get('Применить текущий текст перед продолжением?',
+                          'Apply the current text before continuing?'),
+            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Apply:
+            self.pending_action = action
+            if not self.apply():
+                self.pending_action = None
+                if canceled:
+                    canceled()
+            return True
+        if answer == QMessageBox.StandardButton.Discard:
+            self.clear_selection()
+            action()
+            return True
+        if canceled:
+            canceled()
+        return False
+
+    def set_mode(self, mode, prompt=True):
+        if self.closed or self.busy:
+            return False
         if self.read_only:
-            self.view.set_mode('view')
+            self._apply_mode('view')
+            return True
+        if mode == self.view.mode:
+            if not prompt and mode in ('view', 'region') and self.has_draft():
+                return False
+            self._apply_mode(mode)
+            return True
+        if mode in ('view', 'region') and self.has_draft():
+            if not prompt:
+                return False
+            return self.resolve_draft(lambda: self._apply_mode(mode))
+        self._apply_mode(mode)
+        return True
+
+    def _apply_mode(self, mode):
+        if self.closed:
             return
         self.view.set_mode(mode)
         if mode == 'view':
             self.active_area = self.pending_area = None
             self.clear_selection()
-            self.notice('Режим просмотра. Колесо мыши меняет масштаб.',
-                        'View mode. Scroll to zoom.')
+            if self.read_only:
+                self.notice('Только просмотр. Сохранение копии доступно.',
+                            'Read-only. Saving a copy is still available.')
+            else:
+                self.notice('Режим просмотра. Колесо мыши меняет масштаб.',
+                            'View mode. Scroll to zoom.')
         elif mode == 'region':
+            self.active_area = self.pending_area = None
+            self.clear_selection()
             self.notice('Обведите прямоугольником нужную часть чертежа.',
                         'Drag a rectangle over the area you want to edit.')
         else:
@@ -399,7 +806,7 @@ class Workspace(QWidget):
                         'Click text. Drag with the middle button to pan.')
 
     def hit(self, xy):
-        margin = 7 / self.view.zoom
+        margin = 7 / max(self.view.zoom, .01)
         x, y = xy
         self.query((x-margin, y-margin, x+margin, y+margin), xy)
 
@@ -450,13 +857,26 @@ class Workspace(QWidget):
         runs = {r.id: self.document.get(self.current, r) for r in index.area(bounds)
                 if (self.current, r.id) not in self.document.edits}
         for (page, id_), edit in self.document.edits.items():
-            if page == self.current and edit.text and intersects(edit.bounds(), bounds):
+            if page != self.current or not edit.text:
+                continue
+            try:
+                edit_bounds = edit.bounds()
+            except Exception:
+                LOG.debug('An existing edit has no usable bounds', exc_info=True)
+                continue
+            if intersects(edit_bounds, bounds):
                 runs[id_] = edit
         self.clear_selection()
         if xy and runs:
             x, y = xy
-            choice = min(runs.values(), key=lambda edit: hypot(edit.x-x, edit.y-y))
-            self.load_edit(choice)
+            try:
+                choice = min(runs.values(), key=lambda edit: hypot(edit.x-x, edit.y-y))
+                self.load_edit(choice)
+            except Exception:
+                LOG.exception('Could not select the nearest text object')
+                self.clear_selection()
+                self.notice('This text object cannot be edited safely.',
+                            'This text object cannot be edited safely.')
         elif runs:
             self.matches.show()
             self.results.update(runs)
@@ -475,62 +895,105 @@ class Workspace(QWidget):
         self.document.metrics.ui = (perf_counter()-start)*1000
 
     def select_item(self, item):
+        if item is None:
+            return
         key = item.data(Qt.ItemDataRole.UserRole)
         if key in self.results:
             self.load_edit(self.results[key])
 
     def load_edit(self, edit):
+        if edit is None:
+            return False
+        try:
+            bounds = edit.bounds()
+        except Exception as error:
+            LOG.exception('The selected text has no usable bounds')
+            self.selected = None
+            self.clear_selection()
+            self.notice('This text object cannot be edited safely. ' + str(error),
+                        'This text object cannot be edited safely. ' + str(error))
+            return False
         self.selected = edit
         self.position_draft = (edit.x, edit.y)
         self.drag_origin = None
         self.view.move_bounds = None
-        self.view.selection = edit.bounds()
+        self.view.selection = bounds
         self.view.preview = None
         self.view.update()
         self.edit_color = edit.color
         temporary = [self.text, self.family, self.size, self.angle, self.italic]
         for widget in temporary:
             widget.blockSignals(True)
-        self.text.setText(edit.text)
-        self.family.setCurrentIndex(self.family.findData(edit.family))
-        self.size.setValue(edit.size)
-        self.angle.setValue(edit.angle)
-        self.italic.setChecked(edit.is_italic())
-        for widget in temporary:
-            widget.blockSignals(False)
-        editable = not edit.original or edit.original.editable
+        try:
+            self.text.setMaxLength(max(MAX_TEXT_LENGTH, len(edit.text)))
+            self.text.setText(edit.text)
+            family_index = self.family.findData(edit.family)
+            if family_index < 0:
+                self.family.addItem(str(edit.family), edit.family)
+                family_index = self.family.findData(edit.family)
+            self.family.setCurrentIndex(family_index)
+            self.size.setRange(min(.01, float(edit.size)), max(5000., float(edit.size)))
+            self.size.setValue(edit.size)
+            self.angle.setRange(min(-360., float(edit.angle)), max(360., float(edit.angle)))
+            self.angle.setValue(edit.angle)
+            try:
+                italic = edit.is_italic()
+            except Exception:
+                LOG.debug('Could not inspect the italic style', exc_info=True)
+                italic = False
+            self.italic.setChecked(italic)
+        finally:
+            for widget in temporary:
+                widget.blockSignals(False)
+        editable = not self.read_only and (not edit.original or edit.original.editable)
         self.view.move_enabled = editable and not self.busy
         self.form.setEnabled(editable and not self.busy)
         self.form.show()
-        self.remove_button.setEnabled(bool(edit.text))
+        self.remove_button.setEnabled(editable and bool(edit.text))
         self.color_label()
         self.font_label(edit)
-        if not editable:
-            self.notice('Текст доступен для просмотра. Структура объекта ограничивает правку.',
-                        'Text is available for inspection. Its structure restricts editing.')
+        if self.read_only:
+            self.notice('Только просмотр. Сохранение копии доступно.',
+                        'Read-only. Saving a copy is still available.')
+        elif not editable:
+            reason = getattr(edit.original, 'reason', '') if edit.original else ''
+            detail = f' {reason}' if reason else ''
+            self.notice('Текст доступен для просмотра. Структура объекта ограничивает правку.'+detail,
+                        'Text is available for inspection. Its structure restricts editing.'+detail)
         elif edit.original:
-            self.notice(f'{edit.original.font.name} · перетащите рамку',
-                        f'{edit.original.font.name} · drag the selection')
+            notice = f'{edit.original.font.name} · перетащите рамку'
+            self.notice(notice, f'{edit.original.font.name} · drag the selection')
         else:
             self.notice('Введите текст и перетащите его на нужное место.',
                         'Enter text and drag it into place.')
+        return True
 
     def font_label(self, edit):
-        warning = edit.text and edit.family == 'Original' and edit.current_font() != 'Original'
-        family = edit.current_font()
-        self.italic.setEnabled(not edit.native_italic())
-        if edit.native_italic() and not self.italic.isChecked():
-            blocked = self.italic.blockSignals(True)
-            self.italic.setChecked(True)
-            self.italic.blockSignals(blocked)
-        self.font_notice.setText(self.lang.get(f'Для этих символов встраивается {family}.',
-            f'{family} will be embedded for these characters.') if warning else '')
+        try:
+            warning = bool(edit.text and edit.family == 'Original' and edit.current_font() != 'Original')
+            family = edit.current_font()
+            self.italic.setEnabled(not edit.native_italic())
+            if edit.native_italic() and not self.italic.isChecked():
+                blocked = self.italic.blockSignals(True)
+                self.italic.setChecked(True)
+                self.italic.blockSignals(blocked)
+            self.font_notice.setText(self.lang.get(f'Для этих символов встраивается {family}.',
+                f'{family} will be embedded for these characters.') if warning else '')
+        except Exception:
+            LOG.debug('Could not update the font preview label', exc_info=True)
+            self.font_notice.clear()
 
     def color_label(self):
-        label = QColor.fromRgbF(*self.edit_color).name().upper() if self.edit_color else self.lang.get('Исходный', 'Original')
+        try:
+            label = QColor.fromRgbF(*self.edit_color).name().upper() if self.edit_color else self.lang.get('Исходный', 'Original')
+        except (TypeError, ValueError):
+            label = self.lang.get('Исходный', 'Original')
         self.color.setText(label)
 
     def read_fields(self):
+        if self.selected is None:
+            return None
+
         def entered(control, previous):
             return previous if abs(control.value()-previous) < .0005 else control.value()
         x, y = self.position_draft
@@ -538,7 +1001,17 @@ class Workspace(QWidget):
                        size=entered(self.size, self.selected.size),
                        angle=entered(self.angle, self.selected.angle), color=self.edit_color,
                        family=self.family.currentData())
-        if not edit.native_italic() and self.italic.isChecked() != edit.is_italic():
+        try:
+            native_italic = edit.native_italic()
+        except Exception:
+            LOG.debug('Could not inspect native italics', exc_info=True)
+            native_italic = False
+        try:
+            is_italic = edit.is_italic()
+        except Exception:
+            LOG.debug('Could not inspect the italic style', exc_info=True)
+            is_italic = bool(self.italic.isChecked())
+        if not native_italic and self.italic.isChecked() != is_italic:
             edit = replace(edit, italic=self.italic.isChecked())
         return edit
 
@@ -551,15 +1024,25 @@ class Workspace(QWidget):
             self.preview()
 
     def preview(self, *_):
-        if self.selected and not self.busy:
+        if self.selected is None or self.busy or not self.form.isEnabled():
+            return
+        try:
             edit = self.read_fields()
+            if edit is None:
+                return
             self.font_label(edit)
             self.view.preview = edit if edit != self.selected else None
-            if edit.original is None and edit.text:
+            self.remove_button.setEnabled(bool(edit.text))
+            if edit.text:
                 try:
                     self.view.selection = edit.bounds()
-                except ValueError:
+                except (TypeError, ValueError, FileNotFoundError, OSError):
                     self.view.selection = None
+            self.view.update()
+        except Exception:
+            LOG.exception('Could not update the edit preview')
+            self.view.preview = None
+            self.font_notice.setText(self.lang.get('Предпросмотр недоступен.', 'Preview unavailable.'))
             self.view.update()
 
     def preview_move(self, delta):
@@ -570,55 +1053,99 @@ class Workspace(QWidget):
             self.view.move_bounds = None
             self.preview()
             return
-        if self.drag_origin is None:
-            self.drag_origin = self.read_fields()
-        dx, dy = delta
-        edit = replace(self.drag_origin, x=self.drag_origin.x+dx, y=self.drag_origin.y+dy)
-        self.view.preview = edit
-        if self.view.selection:
-            l, b, r, t = self.view.selection
-            self.view.move_bounds = l+dx, b+dy, r+dx, t+dy
-        self.view.update()
+        try:
+            if self.drag_origin is None:
+                self.drag_origin = self.read_fields()
+            if self.drag_origin is None:
+                return
+            dx, dy = delta
+            edit = replace(self.drag_origin, x=self.drag_origin.x+dx, y=self.drag_origin.y+dy)
+            self.view.preview = edit
+            if self.view.selection:
+                l, b, r, t = self.view.selection
+                self.view.move_bounds = l+dx, b+dy, r+dx, t+dy
+            self.view.update()
+        except Exception:
+            LOG.exception('Could not update the drag preview')
+            self.view.preview = None
+            self.view.update()
 
     def finish_move(self, delta):
-        if delta is None or not self.selected or self.busy:
-            self.preview_move(None)
-            return
-        self.preview_move(delta)
-        edit = self.view.preview
-        self.drag_origin = None
-        self.view.move_bounds = None
-        if not edit or not edit.text:
-            return
-        self.position_draft = (edit.x, edit.y)
-        if edit.original is None and (edit.page, edit.id) not in self.document.edits:
-            self.preview()
-        else:
-            self.edit(edit)
+        try:
+            if delta is None or not self.selected or self.busy:
+                self.preview_move(None)
+                return
+            self.preview_move(delta)
+            edit = self.view.preview
+            self.drag_origin = None
+            self.view.move_bounds = None
+            if not edit or not edit.text:
+                return
+            self.position_draft = (edit.x, edit.y)
+            if edit.original is None and (edit.page, edit.id) not in self.document.edits:
+                self.preview()
+            else:
+                self.edit(edit)
+        finally:
+            self.drag_origin = None
+            self.view.move_bounds = None
 
     def add(self):
-        if not self.sheets or self.busy or self.read_only or not self.permission_checked:
+        if self.has_draft():
+            self.resolve_draft(self._add)
             return
+        self._add()
+
+    def _add(self):
+        if self.closed or self.busy or self.read_only:
+            return
+        if not self.sheets or not self.permission_checked:
+            self.notice('Подождите, пока загрузится документ.', 'Wait until the document is loaded.')
+            return
+        if self.current not in self.sheet_loaded:
+            self.notice('Подождите, пока загрузятся размеры листа.', 'Wait until the sheet dimensions load.')
+            return
+        self.active_area = self.pending_area = None
+        self.matches.clear()
+        self.matches.hide()
+        self.results.clear()
         center = self.view.visible().center()
         position = self.view.transform().map(center)
         x, y = self.view.document_point(position)
-        self.load_edit(Edit(self.current, self.document.allocate(), '', x, y, 12., 0., family='ISO 3098'))
+        self.text.setMaxLength(MAX_TEXT_LENGTH)
+        try:
+            loaded = self.load_edit(Edit(self.current, self.document.allocate(), '', x, y, 12., 0.,
+                                         family='ISO 3098'))
+        except Exception as error:
+            self.window.error(error)
+            return
+        if not loaded:
+            return
         self.view.selection = None
+        self.view.update()
+        self.remove_button.setEnabled(False)
         self.text.setFocus()
 
     def apply(self):
         if not self.selected or self.busy or not self.form.isEnabled():
-            return
-        edit = self.read_fields()
-        if not edit.text:
-            return
-        self.edit(edit)
+            return False
+        try:
+            edit = self.read_fields()
+        except Exception:
+            LOG.exception('Could not read the edit fields')
+            return False
+        if not edit or not edit.text:
+            return False
+        return self.edit(edit)
 
     def remove(self):
         if self.selected and not self.busy and self.form.isEnabled():
-            self.edit(replace(self.selected, text=''))
+            return self.edit(replace(self.selected, text=''))
+        return False
 
     def edit(self, edit):
+        if self.busy or self.closed:
+            return False
         state = self.document.edits.copy()
         key = edit.page, edit.id
         if (edit.original and edit == Edit.from_run(edit.page, edit.original)) or (not edit.original and not edit.text):
@@ -627,27 +1154,50 @@ class Workspace(QWidget):
             state[key] = edit
         if state != self.document.edits:
             self.change_state(state, None, edit if edit.text else None)
+            return True
+        return False
 
     def travel(self, step):
         target = self.document.cursor+step
         if not self.busy and 0 <= target < len(self.document.states):
             self.change_state(self.document.states[target], target, None)
 
+    def _discard(self, path):
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            LOG.debug('Could not remove temporary version %s', path, exc_info=True)
+
     def change_state(self, state, cursor, selection):
+        if self.closed:
+            return
         try:
             affected = self.differences(state)
         except Exception as error:
             self.window.error(error)
             return
-        self.busy = True
+        self.job_token += 1
+        token = self.job_token
+        self.set_busy(True)
         self.form.setEnabled(False)
         self.view.move_enabled = False
         self.notice('Применяем локальную правку…', 'Applying local edit…')
-        key, path = self.document.new_version()
-        self.window.update_actions()
-        self.bridge.submit(self.editor.executor, self.editor.save,
-            lambda task: self.prepared(task, key, path, state, cursor, affected, selection),
-            self.document, path, state)
+        try:
+            key, path = self.document.new_version()
+        except Exception as error:
+            self.set_busy(False)
+            self.window.error(error)
+            self.update_selection_flags()
+            return
+        try:
+            self.bridge.submit(self.editor.executor, self.editor.save,
+                lambda task: self.prepared(task, key, path, state, cursor, affected, selection, token),
+                self.document, path, state)
+        except Exception as error:
+            self._discard(path)
+            self.set_busy(False)
+            self.window.error(error)
+            self.update_selection_flags()
 
     def differences(self, state):
         dirty = {}
@@ -657,111 +1207,332 @@ class Workspace(QWidget):
             if left == right:
                 continue
             original = (left or right).original
-            bounds = [edit.bounds() for edit in (left, right) if edit and edit.text]
+            bounds = []
+            for edit in (left, right):
+                if edit and edit.text:
+                    try:
+                        bounds.append(edit.bounds())
+                    except Exception:
+                        LOG.debug('Skipping unavailable edit bounds', exc_info=True)
             if original:
-                bounds.append(original.bounds)
+                try:
+                    bounds.append(original.bounds)
+                except Exception:
+                    LOG.debug('Skipping unavailable original bounds', exc_info=True)
             if bounds:
                 dirty.setdefault(key[0], []).extend(bounds)
         return dirty
 
-    def prepared(self, task, key, path, state, cursor, affected, selection):
+    def prepared(self, task, key, path, state, cursor, affected, selection, token):
+        if self.closed or token != self.job_token:
+            self._discard(path)
+            return
         try:
             elapsed = task.result()
         except Exception as error:
+            self._discard(path)
             self.edit_failed(error)
             return
-        self.bridge.submit(self.render.executor, self.render.attach,
-            lambda result: self.render_ready(result, key, path, state, cursor, affected, selection, elapsed), key, path)
+        try:
+            self.bridge.submit(self.render.executor, self.render.attach,
+                lambda result: self.render_ready(result, key, path, state, cursor, affected,
+                                                 selection, elapsed, token), key, path)
+        except Exception as error:
+            self._discard(path)
+            self.edit_failed(error)
 
-    def render_ready(self, task, key, path, state, cursor, affected, selection, elapsed):
+    def render_ready(self, task, key, path, state, cursor, affected, selection, elapsed, token=None):
+        if self.closed or (token is not None and token != self.job_token):
+            self._discard(path)
+            return
         try:
             task.result()
         except Exception as error:
-            path.unlink(missing_ok=True)
+            self._discard(path)
             self.edit_failed(error)
             return
         document = self.document
         old = document.key
-        document.key = key
-        if cursor is None:
-            document.commit(state)
-        else:
-            document.cursor = cursor
-        self.tiles.clear()
-        invalidated = 0
-        for page, rectangles in affected.items():
-            sheet = self.sheets[page]
-            converted = [box(sheet.to_screen, bounds) for bounds in rectangles]
-            expanded = [(l-2, t-2, r+2, b+2) for l, t, r, b in converted]
-            invalidated += self.view.cache.invalidate(page, expanded)
-            self.thumb_rev.pop(page, None)
-        document.metrics.invalidated = invalidated
-        document.metrics.edit = elapsed
-        self.busy = False
-        self.clear_selection()
-        if selection:
-            self.load_edit(selection)
-        else:
-            self.notice('Правка применена. Сохраните копию PDF.', 'Edit applied. Save a PDF copy.')
-        self.view.refresh()
-        self.window.rename(self)
-        self.window.update_actions()
-        self.bridge.submit(self.render.executor, self.render.close, lambda _: self.clear_old(old), old)
+        try:
+            document.key = key
+            if cursor is None:
+                document.commit(state)
+            else:
+                document.cursor = cursor
+            self.tiles.clear()
+            invalidated = 0
+            for page, rectangles in affected.items():
+                if page not in self.sheets:
+                    continue
+                sheet = self.sheets[page]
+                try:
+                    converted = [box(sheet.to_screen, bounds) for bounds in rectangles]
+                    expanded = [(l-2, t-2, r+2, b+2) for l, t, r, b in converted]
+                    invalidated += self.view.cache.invalidate(page, expanded)
+                except (TypeError, ValueError, ZeroDivisionError, KeyError):
+                    LOG.debug('Could not invalidate edited tiles', exc_info=True)
+                self.thumb_rev.pop(page, None)
+            document.metrics.invalidated = invalidated
+            document.metrics.edit = elapsed
+            document.write_journal(path)
+            self.set_busy(False)
+            self.clear_selection()
+            show = selection if selection is not None and selection.page == self.current else None
+            if show is not None:
+                if not self.load_edit(show):
+                    self.notice('Правка применена. Выберите текст заново.',
+                                'Edit applied. Select the text again.')
+            elif selection is not None:
+                self.notice('Правка применена. Выбранный текст относится к другому листу.',
+                            'Edit applied. The selected text belonged to another sheet.')
+            else:
+                self.notice('Правка применена. Сохраните копию PDF.', 'Edit applied. Save a PDF copy.')
+            self.view.refresh()
+            self.window.rename(self)
+            try:
+                self.bridge.submit(self.render.executor, self.render.close,
+                                   lambda _: self.clear_old(old), old)
+            except Exception:
+                LOG.exception('Could not schedule closing the previous PDF version')
+        except Exception as error:
+            LOG.exception('Unexpected error after an edit was attached')
+            self.edit_failed(error)
+        finally:
+            self.set_busy(False)
+            self.window.update_actions()
+            pending = self.pending_action
+            self.pending_action = None
+            if pending is not None:
+                try:
+                    pending()
+                except Exception:
+                    LOG.exception('Could not continue after applying the draft')
 
     def clear_old(self, key):
-        if ':' in key:
-            (Path(self.document.workspace.name) / (key.split(':', 1)[1]+'.pdf')).unlink(missing_ok=True)
+        try:
+            if ':' in key:
+                (Path(self.document.workspace.name) / (key.split(':', 1)[1]+'.pdf')).unlink(missing_ok=True)
+        except OSError:
+            LOG.debug('Could not remove the previous temporary version', exc_info=True)
+
+    def update_selection_flags(self):
+        editable = (self.selected is not None and not self.read_only and not self.busy
+                    and (self.selected.original is None or self.selected.original.editable))
+        try:
+            self.form.setEnabled(editable)
+        except RuntimeError:
+            pass
+        self.view.move_enabled = editable
 
     def edit_failed(self, error):
-        self.busy = False
-        self.form.setEnabled(True)
-        self.view.move_enabled = bool(self.selected)
-        if self.selected:
-            self.position_draft = (self.selected.x, self.selected.y)
-            self.preview()
-        self.notice('Правка отклонена. Исходный PDF сохранён.', 'Edit blocked. Source PDF preserved.')
-        self.window.error(error)
-        self.window.update_actions()
-
-    def save(self):
-        if self.busy:
+        if self.closed:
             return
-        path = self.document.source
-        default = str(path.with_name(path.stem+'_edited.pdf'))
-        selected, _ = QFileDialog.getSaveFileName(self, self.lang.get('Сохранить копию PDF', 'Save PDF copy'),
-                                                  default, 'PDF (*.pdf)')
-        if not selected:
-            return
-        target = Path(selected)
-        if target.suffix.lower() != '.pdf':
-            target = target.with_suffix('.pdf')
-        self.busy = True
-        self.window.update_actions()
-        self.notice('Сохраняем копию PDF…', 'Saving PDF copy…')
-        state = self.document.edits.copy()
-        self.bridge.submit(self.editor.executor, self.editor.save,
-            lambda task: self.saved(target, state, task), self.document, target, state)
-
-    def saved(self, target, state, task):
-        self.busy = False
         try:
-            self.document.metrics.saved = task.result()
+            self.set_busy(False)
+            self.pending_action = None
+            self.update_selection_flags()
+            if self.selected:
+                self.position_draft = (self.selected.x, self.selected.y)
+            self.notice('Правка отклонена. Исходный PDF сохранён.',
+                        'Edit blocked. The source PDF was preserved.')
+            try:
+                self.window.error(error)
+            except Exception:
+                LOG.exception('Could not show the edit error dialog')
+            if self.selected:
+                try:
+                    self.preview()
+                except Exception:
+                    LOG.exception('The failed edit preview could not be restored')
+                    self.view.preview = None
+                    self.view.update()
+        finally:
+            self.set_busy(False)
+            self.window.update_actions()
+
+    def save_state(self):
+        state = self.document.edits.copy()
+        draft = self.current_draft()
+        if draft is not None:
+            key = draft.page, draft.id
+            if draft.original is None and not draft.text:
+                state.pop(key, None)
+            else:
+                state[key] = draft
+        return state, draft
+
+    def _finish_after(self, after, success):
+        if after is None:
+            return
+        try:
+            after(success)
+        except Exception:
+            LOG.exception('Could not finish the save continuation')
+
+    def save(self, after=None):
+        if self.closed:
+            self._finish_after(after, False)
+            return False
+        if self.busy:
+            self.notice('Дождитесь окончания операции.', 'Wait for the current operation.')
+            self._finish_after(after, False)
+            return False
+        if not self.sheets:
+            self.notice('Сначала откройте PDF.', 'Open a PDF before saving.')
+            self._finish_after(after, False)
+            return False
+        settings = getattr(self.window, 'settings', None)
+        try:
+            last = settings.value('last-directory', str(self.document.source.parent)) if settings else str(self.document.source.parent)
+        except Exception:
+            last = str(self.document.source.parent)
+        if not last:
+            last = str(self.document.source.parent)
+        default = str(Path(str(last)) / (self.document.source.stem+'_edited.pdf'))
+        try:
+            selected, _ = QFileDialog.getSaveFileName(self, self.lang.get('Сохранить копию PDF', 'Save PDF copy'),
+                                                      default, 'PDF (*.pdf)')
         except Exception as error:
             self.window.error(error)
+            self._finish_after(after, False)
+            return False
+        if not selected:
+            self._finish_after(after, False)
+            return False
+        target = pdf_target(selected)
+        try:
+            conflict = self.window.destination_conflict(target)
+        except Exception as error:
+            self.window.error(error)
+            self._finish_after(after, False)
+            return False
+        if conflict:
+            self.window.message(conflict)
+            self._finish_after(after, False)
+            return False
+        try:
+            if target.exists():
+                answer = self.window.ask(
+                    self.lang.get('Файл существует', 'File exists'),
+                    self.lang.get(f'Файл «{target.name}» уже существует. Заменить его?',
+                                  f'“{target.name}” already exists. Replace it?'),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self._finish_after(after, False)
+                    return False
+        except Exception as error:
+            self.window.error(error)
+            self._finish_after(after, False)
+            return False
+        if settings:
+            try:
+                settings.setValue('last-directory', str(target.parent))
+            except Exception:
+                LOG.debug('Could not remember the last save directory', exc_info=True)
+        state, draft = self.save_state()
+        self.save_token += 1
+        token = self.save_token
+        self.set_busy(True)
+        self.form.setEnabled(False)
+        self.view.move_enabled = False
+        if self.document.source_changed():
+            self.notice('Исходник изменился; экспортируем из внутренней копии…',
+                        'Source changed; exporting from the internal snapshot…')
         else:
-            self.document.exported = state
-            self.window.rename(self)
-            self.notice(f'Копия сохранена: {target.name}', f'Copy saved: {target.name}')
-        self.window.update_actions()
+            self.notice('Сохраняем копию PDF…', 'Saving PDF copy…')
+        try:
+            self.bridge.submit(self.editor.executor, self.editor.save,
+                lambda task: self.saved(target, state, draft, token, after, task),
+                self.document, target, state)
+        except Exception as error:
+            self.set_busy(False)
+            self.update_selection_flags()
+            self.window.error(error)
+            self.notice('Не удалось сохранить копию. Исходный PDF не изменён.',
+                        'Saving failed. The source PDF was not changed.')
+            self._finish_after(after, False)
+            return False
+        return True
+
+    def saved(self, target, state, draft, token, after, task):
+        success = False
+        try:
+            if self.closed or token != self.save_token:
+                return
+            try:
+                elapsed = task.result()
+            except Exception as error:
+                self.notice('Не удалось сохранить копию. Исходный PDF не изменён.',
+                            'Saving failed. The source PDF was not changed.')
+                self.window.error(error)
+                return
+            document = self.document
+            if state != document.edits:
+                document.commit(state)
+            if draft is not None:
+                key = draft.page, draft.id
+                if key in state:
+                    self.selected = state[key]
+                    self.position_draft = (self.selected.x, self.selected.y)
+                    self.view.preview = None
+                    try:
+                        self.view.selection = self.selected.bounds()
+                    except Exception:
+                        self.view.selection = None
+                else:
+                    self.clear_selection()
+            document.exported = state
+            document.export_name = target.name
+            document.metrics.saved = elapsed
+            success = True
+            try:
+                self.window.rename(self)
+            except Exception:
+                LOG.exception('Could not rename the saved tab')
+            try:
+                changed = document.source_changed()
+                self.notice(
+                    f'Копия сохранена: {target.name}' +
+                    (' Исходник изменился; экспортирована внутренняя копия.' if changed else ''),
+                    f'Copy saved: {target.name}' +
+                    (' Source changed; exported from the internal snapshot.' if changed else ''),
+                )
+            except Exception:
+                LOG.exception('Could not show the save notice')
+        except Exception as error:
+            LOG.exception('Unexpected error after saving a copy')
+            self.notice('Не удалось завершить сохранение копии.',
+                        'The copy was saved, but the window state could not be updated.')
+            self.window.error(error)
+        finally:
+            if not self.closed and token == self.save_token:
+                self.set_busy(False)
+                self.update_selection_flags()
+                self.window.update_actions()
+                QTimer.singleShot(0, self.queue_thumbnails)
+                self._finish_after(after, success)
 
     def close_workspace(self):
+        if self.closed:
+            return
         self.closed = True
+        self.document.disposed = True
+        self.pending_action = None
         if self.tile_job:
             self.tile_job.cancel()
         for future in self.thumb_jobs.values():
             future.cancel()
-        self.bridge.submit(self.render.executor, self.render.close,
-                           lambda _: self.document.workspace.cleanup(), self.document.key)
+        self.thumb_jobs.clear()
+        self.thumb_icons.clear()
+        key = self.document.key
+        try:
+            self.bridge.submit(self.render.executor, self.render.close,
+                               lambda _: self.document.cleanup(), key)
+        except Exception:
+            LOG.exception('Could not schedule workspace cleanup')
+            self.document.cleanup()
 
 
 def intersects(a, b):
@@ -780,18 +1551,23 @@ def format_name(sheet):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        app = QApplication.instance()
+        if app is not None:
+            app.setApplicationName('VECTOR PDF')
+            app.setApplicationVersion(VERSION)
         self.setWindowTitle('VECTOR PDF')
         self.resize(1320, 820)
-        self.setMinimumSize(930, 565)
+        self.setMinimumSize(780, 480)
         self.setAcceptDrops(True)
         self.settings = QSettings('VectorPDF', 'VectorPDF')
+        self.safe_mode = safe_mode()
         self.lang = Language(self.settings.value('language', 'ru'))
         self.appearance = self.settings.value('appearance', 'dark' if self.settings.value('dark', True, type=bool) else 'light')
         if self.appearance not in THEMES:
             self.appearance = 'dark'
         self.surface = THEMES[self.appearance][-1]
-        self.setWindowIcon(QIcon(str(ASSETS / 'vector-pdf.png')))
-        self.bridge = Bridge()
+        self.setWindowIcon(QIcon(str(APP_ICON)))
+        self.bridge = Bridge(self)
         self.render = RenderEngine()
         self.editor = LocalEditor()
         self.actions = {}
@@ -799,6 +1575,14 @@ class MainWindow(QMainWindow):
         self.updating = False
         self.pending_update = None
         self.restart_requested = False
+        self._active_index = None
+        self._active_tab = None
+        self._suppress_draft = False
+        self._pending_quit = False
+        self._allow_close = False
+        self._quit_queue = []
+        self._quit_position = 0
+        self._quit_tabs = []
 
         root = QWidget()
         vertical = QVBoxLayout(root)
@@ -842,7 +1626,15 @@ class MainWindow(QMainWindow):
         ]:
             self.button(row, name, ru, en, fn)
         self.actions['rotate'].setToolTip(self.lang.get('Повернуть вид на 90°', 'Rotate the view by 90°'))
-        vertical.addWidget(header)
+        self.toolbar_scroll = QScrollArea()
+        self.toolbar_scroll.setWidget(header)
+        self.toolbar_scroll.setWidgetResizable(False)
+        self.toolbar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.toolbar_scroll.setFixedHeight(75)
+        self.toolbar_scroll.viewport().setAutoFillBackground(False)
+        vertical.addWidget(self.toolbar_scroll)
         vertical.addWidget(Ribbon())
 
         self.tabs = QTabWidget(tabsClosable=True, movable=True)
@@ -870,21 +1662,38 @@ class MainWindow(QMainWindow):
         status = QWidget(objectName='status')
         bar = QHBoxLayout(status)
         bar.setContentsMargins(13, 5, 13, 6)
-        self.status_sheet, self.status_view, self.status_coord = QLabel(), QLabel(), QLabel()
+        self.status_sheet, self.status_message, self.status_view, self.status_coord = QLabel(), QLabel(), QLabel(), QLabel()
+        self.status_version = QLabel(f'v{VERSION}')
+        self.status_message.setObjectName('panelNote')
+        self.status_version.setObjectName('panelNote')
+        for label in (self.status_sheet, self.status_message, self.status_view,
+                      self.status_coord, self.status_version):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setOpenExternalLinks(False)
         bar.addWidget(self.status_sheet)
-        bar.addStretch()
+        bar.addWidget(self.status_message, 1)
         bar.addWidget(self.status_view)
         bar.addSpacing(15)
         bar.addWidget(self.status_coord)
+        bar.addSpacing(15)
+        bar.addWidget(self.status_version)
         vertical.addWidget(status)
         self.build_menu()
         self.update_menu()
         self.make_diagnostics()
         self.apply_theme()
         self.current_changed()
-        if sys.platform == 'win32':
-            QTimer.singleShot(1700, lambda: self.check_updates(False)
-                              if self.auto_update.isChecked() else None)
+        if sys.platform == 'win32' and not self.safe_mode:
+            QTimer.singleShot(1700, self.start_automatic_update)
+        if not os.environ.get('VECTORPDF_NO_RECOVERY'):
+            QTimer.singleShot(350, self.start_recovery)
+
+    def start_automatic_update(self):
+        try:
+            if self.auto_update.isChecked():
+                self.check_updates(False)
+        except RuntimeError:
+            pass
 
     def button(self, layout, name, ru, en, slot, shortcut=None):
         action = QAction(self)
@@ -906,6 +1715,10 @@ class MainWindow(QMainWindow):
         self.lang.bind(file.setTitle, 'Файл', 'File')
         file.addAction(self.actions['open'])
         file.addAction(self.actions['save'])
+        reload_source = file.addAction('')
+        self.lang.bind(reload_source.setText, 'Перечитать исходник', 'Reload source')
+        reload_source.setShortcut(QKeySequence('F5'))
+        reload_source.triggered.connect(self.reload_source)
         font = file.addAction('')
         self.lang.bind(font.setText, 'Добавить шрифт…', 'Import font…')
         font.triggered.connect(self.import_font)
@@ -936,27 +1749,49 @@ class MainWindow(QMainWindow):
         self.lang.bind(lang.setTitle, 'Язык', 'Language')
         lang.addAction('Русский', lambda: self.language('ru'))
         lang.addAction('English', lambda: self.language('en'))
+        help_menu = self.menuBar().addMenu('')
+        self.lang.bind(help_menu.setTitle, 'Справка', 'Help')
+        about = help_menu.addAction('')
+        self.lang.bind(about.setText, 'О программе', 'About')
+        about.triggered.connect(self.about)
+        licenses = help_menu.addAction('')
+        self.lang.bind(licenses.setText, 'Сторонние лицензии', 'Third-party licenses')
+        licenses.triggered.connect(self.show_licenses)
+        logs = help_menu.addAction('')
+        self.lang.bind(logs.setText, 'Открыть папку журналов', 'Open log folder')
+        logs.triggered.connect(self.open_logs)
         self.view_menu = view
 
     def update_menu(self):
         menu = self.menuBar().addMenu('')
         self.lang.bind(menu.setTitle, 'Обновления', 'Updates')
-        menu.setEnabled(sys.platform == 'win32')
+        self.update_menu_widget = menu
         check = menu.addAction('')
         self.lang.bind(check.setText, 'Проверить обновления', 'Check for updates')
         check.triggered.connect(lambda: self.check_updates(True))
+        self.check_update_action = check
         self.auto_update = menu.addAction('')
         self.lang.bind(self.auto_update.setText, 'Загружать автоматически', 'Download automatically')
         self.auto_update.setCheckable(True)
-        self.auto_update.setChecked(self.settings.value('auto-update', True, type=bool))
+        self.auto_update.setChecked(self.settings.value('auto-update', False, type=bool))
         self.auto_update.toggled.connect(lambda flag: self.settings.setValue('auto-update', flag))
         self.restart_update = menu.addAction('')
         self.lang.bind(self.restart_update.setText, 'Перезапустить и обновить', 'Restart and update')
         self.restart_update.setEnabled(False)
         self.restart_update.triggered.connect(self.restart_for_update)
+        if self.safe_mode:
+            check.setEnabled(False)
+            self.auto_update.setEnabled(False)
+            self.restart_update.setEnabled(False)
+            notice = menu.addAction('')
+            self.lang.bind(notice.setText, 'Безопасный режим: обновления отключены',
+                           'Safe mode: updates are disabled')
+            notice.setEnabled(False)
+        else:
+            menu.setEnabled(sys.platform == 'win32')
 
     def check_updates(self, manual):
-        if self.updating or self.pending_update or sys.platform != 'win32':
+        if self.safe_mode or self.updating or self.pending_update or sys.platform != 'win32':
             return
         self.updating = True
         def work():
@@ -967,6 +1802,7 @@ class MainWindow(QMainWindow):
                 else:
                     result.set_result(None)
             except Exception as error:
+                LOG.warning('Update check failed', exc_info=True)
                 result.set_exception(error)
             try:
                 self.bridge.complete.emit(lambda future: self.update_ready(future, manual), result)
@@ -988,22 +1824,37 @@ class MainWindow(QMainWindow):
                 f'Обновление {self.pending_update} готово. Оно установится при следующем запуске.',
                 f'Update {self.pending_update} is ready. It will start on the next launch.')
             if manual:
-                QMessageBox.information(self, 'VECTOR PDF', message)
+                self.message(message, icon=QMessageBox.Icon.Information)
             else:
-                self.statusBar().showMessage(message, 10000)
+                self.flash(message, 10000)
         elif manual:
-            QMessageBox.information(self, 'VECTOR PDF', self.lang.get(
-                'Установлена последняя версия.', 'You are on the latest version.'))
+            self.message(self.lang.get('Установлена последняя версия.', 'You are on the latest version.'),
+                         icon=QMessageBox.Icon.Information)
 
     def restart_for_update(self):
         if self.pending_update:
-            self.restart_requested = self.close()
+            self.restart_requested = True
+            self.close()
+
+    def flash(self, text, timeout=8000):
+        self.status_message.setText(text)
+
+        def clear():
+            try:
+                if self.status_message.text() == text:
+                    self.status_message.setText('')
+            except RuntimeError:
+                pass
+
+        QTimer.singleShot(timeout, clear)
 
     def make_diagnostics(self):
         self.dock = QDockWidget()
         self.lang.bind(self.dock.setWindowTitle, 'Диагностика', 'Diagnostics')
         self.diagnostics = QLabel()
         self.diagnostics.setContentsMargins(12, 10, 12, 12)
+        self.diagnostics.setTextFormat(Qt.TextFormat.PlainText)
+        self.diagnostics.setOpenExternalLinks(False)
         self.diagnostics.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.dock.setWidget(self.diagnostics)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.dock)
@@ -1056,9 +1907,12 @@ class MainWindow(QMainWindow):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
         self.setStyleSheet(stylesheet(self.appearance))
-        self.empty.setStyleSheet('background: '+self.surface)
+        self.empty.setStyleSheet('QWidget#drawing { background: '+self.surface+'; }')
         for i in range(self.tabs.count()):
-            canvas = self.tabs.widget(i).view
+            tab = self.tabs.widget(i)
+            if tab is None:
+                continue
+            canvas = tab.view
             canvas.surface = self.surface
             canvas.update()
 
@@ -1066,8 +1920,8 @@ class MainWindow(QMainWindow):
         self.lang.change(code)
         self.settings.setValue('language', code)
         tab = self.current_tab()
-        if tab and not tab.busy:
-            tab.set_mode(self.mode)
+        if tab and not tab.busy and not tab.has_draft():
+            tab.set_mode(self.mode, prompt=False)
         self.update_status()
         self.show_metrics()
 
@@ -1076,50 +1930,152 @@ class MainWindow(QMainWindow):
 
     def call(self, name, *args):
         if tab := self.current_tab():
-            getattr(tab, name)(*args)
+            return getattr(tab, name)(*args)
+        return None
 
     def canvas(self, name, *args):
         if tab := self.current_tab():
-            getattr(tab.view, name)(*args)
+            return getattr(tab.view, name)(*args)
+        return None
+
+    def sync_mode(self, tab=None):
+        tab = tab or self.current_tab()
+        if tab is None:
+            return
+        mode = self.mode
+        if tab.read_only or not tab.sheets:
+            mode = 'view'
+        if tab.has_draft() and mode in ('view', 'region') and mode != tab.view.mode:
+            actual = self.actions.get(tab.view.mode)
+            if actual is not None:
+                actual.setChecked(True)
+            return
+        action = self.actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
+        if not tab.sheets:
+            tab.view.set_mode('view')
+            return
+        try:
+            tab.set_mode(mode, prompt=False)
+        except RuntimeError:
+            pass
+
+    def _set_global_mode(self, mode):
+        self.mode = mode
+        action = self.actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
 
     def change_mode(self, mode):
-        self.mode = mode
-        self.actions[mode].setChecked(True)
-        self.call('set_mode', mode)
+        tab = self.current_tab()
+        if tab and tab.busy:
+            self.flash(self.lang.get('Дождитесь окончания операции.', 'Wait for the current operation.'))
+            return
+        if tab and tab.read_only:
+            self.mode = mode
+            self.actions['view'].setChecked(True)
+            tab.set_mode('view')
+            return
+        if (tab and mode in ('view', 'region') and mode != tab.view.mode
+                and tab.has_draft()):
+            def apply_mode():
+                self._set_global_mode(mode)
+                tab.set_mode(mode, prompt=False)
+            tab.resolve_draft(apply_mode)
+            actual = self.actions.get(tab.view.mode)
+            if actual is not None:
+                actual.setChecked(True)
+            return
+        self._set_global_mode(mode)
+        if tab:
+            tab.set_mode(mode, prompt=False)
+        self.update_actions()
 
     def add(self):
+        tab = self.current_tab()
+        if tab is None or tab.busy or tab.read_only:
+            return
         self.change_mode('text')
-        self.call('add')
+        tab.add()
 
     def toggle_thumbs(self, state):
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
-            tab.left.setVisible(state)
+            if tab is not None:
+                tab.left.setVisible(state)
         if state:
             self.call('queue_thumbnails')
 
     def update_actions(self):
         tab = self.current_tab()
         ready = bool(tab and tab.sheets)
-        edit = ready and tab.permission_checked and not tab.read_only
-        idle = edit and not tab.busy
+        idle = bool(ready and not tab.busy)
+        editing = bool(idle and tab.permission_checked and not tab.read_only)
+        save_ok = bool(idle and (not tab.read_only or not tab.document.edits))
         for key in ('view', 'fit', 'plus', 'minus', 'rotate'):
             self.actions[key].setEnabled(ready)
         for key in ('text', 'region'):
-            self.actions[key].setEnabled(edit)
-        self.actions['save'].setEnabled(idle)
-        self.actions['add'].setEnabled(idle)
-        self.actions['undo'].setEnabled(idle and tab.document.cursor > 0)
-        self.actions['redo'].setEnabled(idle and tab.document.cursor+1 < len(tab.document.states))
+            self.actions[key].setEnabled(editing)
+        self.actions['save'].setEnabled(save_ok)
+        self.actions['add'].setEnabled(editing)
+        self.actions['undo'].setEnabled(editing and tab.document.cursor > 0)
+        self.actions['redo'].setEnabled(editing and tab.document.cursor+1 < len(tab.document.states))
+        if tab is not None:
+            try:
+                tab.pages.setEnabled(not tab.busy)
+            except RuntimeError:
+                pass
+
+    def trim_inactive(self):
+        active = self.current_tab()
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if tab is None or tab is active:
+                continue
+            try:
+                tab.view.cache.trim(INACTIVE_TILE_BUDGET)
+            except (RuntimeError, AttributeError):
+                pass
 
     def current_changed(self, *_):
+        tab = self.current_tab()
+        previous = getattr(self, '_active_tab', None)
+        if (not self._suppress_draft and previous is not None and previous is not tab
+                and self.tabs.indexOf(previous) >= 0 and not previous.closed and not previous.busy
+                and previous.has_draft()):
+            answer = self.ask(
+                self.lang.get('Неприменённый текст', 'Unapplied text'),
+                self.lang.get('Применить текущий текст перед переключением вкладки?',
+                              'Apply the current text before switching tabs?'),
+                QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer == QMessageBox.StandardButton.Apply:
+                previous.apply()
+            elif answer == QMessageBox.StandardButton.Discard:
+                previous.clear_selection()
+            else:
+                self._suppress_draft = True
+                try:
+                    self.tabs.setCurrentWidget(previous)
+                finally:
+                    self._suppress_draft = False
+                return
+        self._active_tab = tab
         has = bool(self.tabs.count())
         self.empty.setVisible(not has)
         self.tabs.setVisible(has)
-        if tab := self.current_tab():
+        if tab:
             if tab.sheets:
-                tab.set_mode(self.mode)
                 tab.view.refresh()
+            self.sync_mode(tab)
+            try:
+                tab.queue_thumbnails()
+            except RuntimeError:
+                pass
+        self.trim_inactive()
         self.update_actions()
         self.update_status()
 
@@ -1132,11 +2088,15 @@ class MainWindow(QMainWindow):
             self.status_view.clear()
             self.status_coord.clear()
             return
-        name = format_name(sheet)
+        loaded = tab.current in tab.sheet_loaded
+        name = format_name(sheet) if loaded else ''
         page = self.lang.get('Лист', 'Sheet')
-        self.status_sheet.setText(f'{page} {tab.current+1} / {len(tab.sheets)}  ·  {name}')
+        text = f'{page} {tab.current+1} / {len(tab.sheets)}'
+        if name:
+            text += f'  ·  {name}'
+        self.status_sheet.setText(text)
         self.status_view.setText(f'{tab.view.zoom:.0%}  ·  {(tab.view.rotation+sheet.rotation)%360}°')
-        if tab.xy:
+        if tab.xy and loaded and all(isfinite(v) for v in tab.xy):
             x, y = (v*25.4/72 for v in tab.xy)
             self.status_coord.setText(f'X {x:.1f}    Y {y:.1f} mm')
         else:
@@ -1149,16 +2109,20 @@ class MainWindow(QMainWindow):
             return
         try:
             key = import_font(path)
+            QFontDatabase.addApplicationFont(path)
         except Exception as error:
             self.error(error)
             return
         for i in range(self.tabs.count()):
-            choice = self.tabs.widget(i).family
+            tab = self.tabs.widget(i)
+            if tab is None:
+                continue
+            choice = tab.family
             if choice.findData(key) < 0:
                 choice.addItem(key, key)
         if tab := self.current_tab():
             tab.family.setCurrentIndex(tab.family.findData(key))
-        self.status_sheet.setText(self.lang.get('Добавлен шрифт ', 'Font imported ')+Path(path).stem)
+        self.flash(self.lang.get('Добавлен шрифт ', 'Font imported ')+Path(path).stem)
 
     def open_dialog(self):
         paths, _ = QFileDialog.getOpenFileNames(self, self.lang.get('Открыть PDF', 'Open PDF'),
@@ -1166,64 +2130,353 @@ class MainWindow(QMainWindow):
         for path in paths:
             self.open_file(path)
 
-    def open_file(self, path):
-        path = Path(path).resolve()
+    def samefile(self, left, right):
+        return same_path(left, right)
+
+    def destination_conflict(self, target):
         for i in range(self.tabs.count()):
-            if self.tabs.widget(i).document.source == path:
-                self.tabs.setCurrentIndex(i)
-                return
+            tab = self.tabs.widget(i)
+            if tab is None:
+                continue
+            if same_path(target, tab.document.source):
+                return self.lang.get(
+                    f'Файл «{target.name}» уже открыт в другой вкладке. Выберите другое имя или закройте эту вкладку.',
+                    f'“{target.name}” is open in another tab. Choose another name or close that tab.')
+        return None
+
+    def open_file(self, path):
+        if self._pending_quit:
+            return
+        document = None
+        workspace = None
         try:
-            file_stamp(path)
+            resolved = Path(path).resolve()
+            for i in range(self.tabs.count()):
+                tab = self.tabs.widget(i)
+                if tab is not None and same_path(tab.document.source, resolved):
+                    self.tabs.setCurrentIndex(i)
+                    return
+            stamp = file_stamp(resolved)
+        except Exception as error:
+            self.error(error)
+            return
+        try:
+            document = Document(resolved)
+            document.stamp = stamp
+            workspace = Workspace(self, document)
+            index = self.tabs.addTab(workspace, resolved.name)
+            workspace.left.setVisible(self.show_thumbs.isChecked())
+            self.tabs.setTabToolTip(index, str(resolved))
+            self.tabs.setCurrentIndex(index)
+            if not workspace.start():
+                self.finish_close(workspace)
+                return
+            self.current_changed()
+        except Exception as error:
+            LOG.exception('Could not open %s', resolved)
+            if workspace is not None:
+                self.finish_close(workspace)
+            elif document is not None:
+                document.cleanup()
+            self.error(error)
+
+    def reload_source(self):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        if tab.busy:
+            self.message(self.lang.get('Дождитесь окончания операции.', 'Wait for the current operation.'),
+                         icon=QMessageBox.Icon.Information)
+            return
+        source = tab.document.source
+        try:
+            file_stamp(source)
         except OSError as error:
             self.error(error)
             return
-        workspace = Workspace(self, Document(path))
-        index = self.tabs.addTab(workspace, path.name)
-        workspace.left.setVisible(self.show_thumbs.isChecked())
-        self.tabs.setTabToolTip(index, str(path))
-        self.tabs.setCurrentIndex(index)
-        workspace.start()
-        self.current_changed()
+        if tab.has_draft() or tab.document.modified:
+            answer = self.ask(
+                self.lang.get('Перечитать исходник', 'Reload source'),
+                self.lang.get('Отбросить текущие правки и перечитать файл с диска?',
+                              'Discard the current edits and reload the file from disk?'),
+                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Discard:
+                return
+        self.finish_close(tab)
+        self.open_file(source)
 
     def rename(self, workspace):
         index = self.tabs.indexOf(workspace)
-        name = workspace.document.source.name
-        self.tabs.setTabText(index, name + (' *' if workspace.document.modified else ''))
-
-    def error(self, error):
-        QMessageBox.warning(self, self.lang.get('VECTOR PDF · Операция прервана', 'VECTOR PDF · Operation stopped'), str(error))
-
-    def confirm(self, workspace):
-        if workspace.busy:
-            self.status_sheet.setText(self.lang.get('Дождитесь окончания операции.', 'Wait for the current operation.'))
-            return False
-        if not workspace.document.modified:
-            return True
-        result = QMessageBox.question(self,
-            self.lang.get('Несохранённые правки', 'Unsaved edits'),
-            self.lang.get('Закрыть вкладку и отбросить правки?', 'Close the tab and discard the edits?'),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        return result == QMessageBox.StandardButton.Yes
-
-    def close_tab(self, index):
         if index < 0:
             return
-        tab = self.tabs.widget(index)
-        if self.confirm(tab):
-            tab.close_workspace()
+        name = workspace.document.export_name or workspace.document.source.name
+        self.tabs.setTabText(index, name + (' *' if workspace.document.modified else ''))
+
+    def message(self, text, title=None, icon=QMessageBox.Icon.Warning):
+        box = QMessageBox(self)
+        box.setWindowTitle(title or 'VECTOR PDF')
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(str(text))
+        box.setIcon(icon)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def ask(self, title, text, buttons, default):
+        box = QMessageBox(self)
+        box.setWindowTitle(title or 'VECTOR PDF')
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(str(text))
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setStandardButtons(buttons)
+        box.setDefaultButton(default)
+        try:
+            return QMessageBox.StandardButton(box.exec())
+        except Exception:
+            LOG.exception('Could not show a confirmation dialog')
+            return default
+
+    def error(self, error, title=None):
+        LOG.warning('UI operation failed: %s', error, exc_info=True)
+        self.message(friendly_error(error), title or self.lang.get(
+            'VECTOR PDF · Операция прервана', 'VECTOR PDF · Operation stopped'))
+
+    def about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle(self.lang.get('О программе VECTOR PDF', 'About VECTOR PDF'))
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(about_text())
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def show_licenses(self):
+        path = Path(__file__).resolve().parent.parent / 'THIRD_PARTY.md'
+        if path.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            self.message(self.lang.get('Файл THIRD_PARTY.md не найден рядом с приложением.',
+                                       'THIRD_PARTY.md was not found next to the application.'),
+                         icon=QMessageBox.Icon.Information)
+
+    def open_logs(self):
+        try:
+            directory = log_directory()
+            directory.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        except OSError as error:
+            self.error(error)
+
+    def start_recovery(self):
+        if getattr(self, '_recovery_started', False):
+            return
+        self._recovery_started = True
+
+        def work():
+            result = Future()
+            try:
+                cleanup_workspaces()
+                cleanup_temp_files()
+                try:
+                    last = self.settings.value('last-directory')
+                except Exception:
+                    last = None
+                if last:
+                    cleanup_temp_files(Path(str(last)))
+                result.set_result(scan_recovery())
+            except Exception as error:
+                LOG.warning('Recovery scan failed', exc_info=True)
+                result.set_exception(error)
+            try:
+                self.bridge.complete.emit(self.recovery_ready, result)
+            except RuntimeError:
+                pass
+
+        Thread(target=work, name='vector-recovery', daemon=True).start()
+
+    def recovery_ready(self, future):
+        try:
+            candidates = future.result()
+        except Exception:
+            return
+        if not candidates or self._allow_close:
+            return
+        lines = []
+        for candidate in candidates[:6]:
+            lines.append(f'{candidate.source.name}  →  {candidate.version.name}')
+        if len(candidates) > 6:
+            lines.append(f'… +{len(candidates)-6}')
+        text = self.lang.get(
+            'Найдены версии после аварийного закрытия. Открыть их?\n\n',
+            'Recoverable versions were found after an unclean close. Open them?\n\n') + '\n'.join(lines)
+        answer = self.ask(self.lang.get('Восстановление', 'Recovery'), text,
+                          QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Discard,
+                          QMessageBox.StandardButton.Discard)
+        if answer == QMessageBox.StandardButton.Open:
+            for candidate in candidates:
+                self.open_file(candidate.version)
+        elif answer == QMessageBox.StandardButton.Discard:
+            import shutil
+            for candidate in candidates:
+                shutil.rmtree(candidate.workspace, ignore_errors=True)
+
+    def confirm(self, workspace):
+        if workspace is None:
+            return 'discard'
+        if workspace.busy:
+            self.message(self.lang.get(
+                'Вкладка ещё применяет правку. Дождитесь окончания операции и закройте её снова.',
+                'This tab is still applying an edit. Wait for it to finish, then close it again.'),
+                icon=QMessageBox.Icon.Information)
+            return 'cancel'
+        if not workspace.has_draft() and not workspace.document.modified:
+            return 'discard'
+        name = workspace.document.export_name or workspace.document.source.name
+        answer = self.ask(
+            self.lang.get('Несохранённые правки', 'Unsaved edits'),
+            self.lang.get(f'Сохранить копию PDF «{name}» перед закрытием вкладки?',
+                          f'Save a PDF copy of “{name}” before closing this tab?'),
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            return 'save'
+        if answer == QMessageBox.StandardButton.Discard:
+            return 'discard'
+        return 'cancel'
+
+    def finish_close(self, workspace):
+        if workspace is None:
+            return
+        index = self.tabs.indexOf(workspace)
+        if index < 0:
+            try:
+                workspace.close_workspace()
+            finally:
+                workspace.deleteLater()
+            return
+        self._suppress_draft = True
+        try:
+            workspace.close_workspace()
             self.tabs.removeTab(index)
-            tab.deleteLater()
-            self.current_changed()
+            workspace.deleteLater()
+            if getattr(self, '_active_tab', None) is workspace:
+                self._active_tab = None
+        finally:
+            self._suppress_draft = False
+        self.current_changed()
+
+    def close_tab(self, index):
+        if index < 0 or index >= self.tabs.count():
+            return
+        tab = self.tabs.widget(index)
+        if tab is None:
+            return
+        action = self.confirm(tab)
+        if action == 'cancel':
+            return
+        if action == 'save':
+            try:
+                tab.save(after=lambda ok, tab=tab: self.finish_close(tab) if ok else None)
+            except Exception as error:
+                LOG.exception('Could not start saving a tab before closing')
+                self.error(error)
+            return
+        self.finish_close(tab)
+
+    def _cleanup_tabs(self, tabs):
+        for tab in tabs:
+            if tab is None:
+                continue
+            try:
+                tab.close_workspace()
+            except Exception:
+                LOG.exception('Could not clean up a tab while closing')
+
+    def _save_quit_next(self):
+        if not self._pending_quit:
+            return
+        if self._quit_position >= len(self._quit_queue):
+            self._pending_quit = False
+            self._allow_close = True
+            self.close()
+            return
+        tab = self._quit_queue[self._quit_position]
+        if tab is None or tab.closed:
+            self._quit_position += 1
+            QTimer.singleShot(0, self._save_quit_next)
+            return
+
+        def done(ok):
+            if not self._pending_quit:
+                return
+            if not ok:
+                self._pending_quit = False
+                self.restart_requested = False
+                return
+            self._quit_position += 1
+            QTimer.singleShot(0, self._save_quit_next)
+
+        try:
+            tab.save(after=done)
+        except Exception as error:
+            LOG.exception('Could not start saving a tab before quitting')
+            done(False)
+            self.error(error)
 
     def closeEvent(self, event):
         tabs = [self.tabs.widget(i) for i in range(self.tabs.count())]
-        if any(not self.confirm(tab) for tab in tabs):
+        if self._allow_close:
+            self._cleanup_tabs(tabs)
+            super().closeEvent(event)
+            return
+        if self._pending_quit:
             event.ignore()
             return
-        for tab in tabs:
-            tab.close_workspace()
-        super().closeEvent(event)
+        busy = [tab for tab in tabs if tab is not None and tab.busy]
+        if busy:
+            self.message(self.lang.get(
+                'Одна из вкладок ещё применяет правку. Дождитесь окончания операции и закройте приложение снова.',
+                'A tab is still applying an edit. Wait for it to finish, then close the application again.'),
+                icon=QMessageBox.Icon.Information)
+            self.restart_requested = False
+            event.ignore()
+            return
+        needs = [tab for tab in tabs if tab is not None
+                 and (tab.has_draft() or tab.document.modified)]
+        if not needs:
+            self._cleanup_tabs(tabs)
+            super().closeEvent(event)
+            return
+        lines = '\n'.join(f'• {tab.document.source.name}'
+                          + (self.lang.get(' (неприменённый текст)', ' (unapplied text)')
+                             if tab.has_draft() else '') for tab in needs[:8])
+        if len(needs) > 8:
+            lines += f'\n… +{len(needs)-8}'
+        answer = self.ask(
+            self.lang.get('Несохранённые правки', 'Unsaved edits'),
+            self.lang.get(f'Перед выходом сохранить копии для {len(needs)} вкладок?\n\n',
+                          f'Save copies for {len(needs)} tabs before quitting?\n\n') + lines,
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Discard:
+            self._cleanup_tabs(tabs)
+            super().closeEvent(event)
+            return
+        if answer != QMessageBox.StandardButton.Save:
+            self.restart_requested = False
+            event.ignore()
+            return
+        event.ignore()
+        self._pending_quit = True
+        self._quit_tabs = tabs
+        self._quit_queue = list(needs)
+        self._quit_position = 0
+        QTimer.singleShot(0, self._save_quit_next)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() and any(url.toLocalFile().lower().endswith('.pdf') for url in event.mimeData().urls()):
@@ -1237,7 +2490,8 @@ class MainWindow(QMainWindow):
 
 
 def configure_fonts(app):
-    for filename in ('RussoOne-Regular.ttf', 'Exo2-Variable.ttf', 'osifont.ttf'):
+    for filename in ('RussoOne-Regular.ttf', 'Exo2-Variable.ttf', 'osifont.ttf',
+                     'DejaVuSans.ttf', 'DejaVuSerif.ttf', 'DejaVuSansMono.ttf'):
         QFontDatabase.addApplicationFont(str(ASSETS / filename))
     ui_font = QFont()
     ui_font.setFamily('Exo 2')
@@ -1246,16 +2500,40 @@ def configure_fonts(app):
     app.setFont(ui_font)
 
 
-def main():
+def register_fallback_fonts():
+    for path in FALLBACKS.values():
+        try:
+            if isinstance(path, (str, os.PathLike)) and Path(path).is_file():
+                QFontDatabase.addApplicationFont(str(path))
+        except (OSError, RuntimeError, TypeError):
+            LOG.debug('Could not register %s with Qt', path, exc_info=True)
+
+
+def main(ready_token=None):
+    try:
+        setup_logging()
+        install_exception_hooks()
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     app.setApplicationName('VECTOR PDF')
+    app.setApplicationVersion(VERSION)
     app.setStyle('Fusion')
     configure_fonts(app)
-    learn_fonts()
+    try:
+        learn_fonts()
+    except Exception:
+        LOG.exception('Could not load imported fonts')
+    register_fallback_fonts()
     window = MainWindow()
     window.show()
     for path in sys.argv[1:]:
         window.open_file(path)
+    if ready_token:
+        try:
+            write_ready_token(ready_token)
+        except OSError:
+            LOG.warning('Could not write the updater readiness token', exc_info=True)
     exit_code = app.exec()
     window.editor.executor.shutdown(wait=True, cancel_futures=True)
     window.render.shutdown()
