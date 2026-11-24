@@ -1266,7 +1266,7 @@ class Workspace(QWidget):
             self.tiles.clear()
             invalidated = 0
             for page, rectangles in affected.items():
-                if page not in self.sheets:
+                if not 0 <= page < len(self.sheets):
                     continue
                 sheet = self.sheets[page]
                 try:

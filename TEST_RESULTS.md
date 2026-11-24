@@ -17,7 +17,7 @@ $env:VECTORPDF_NO_RECOVERY='1'
 ```
 
 ```
-182 passed, 1 skipped, 3 warnings in 16.20s
+183 passed, 1 skipped, 3 warnings in 10.48s
 ```
 
 Единственный skip — `test_inventor_acceptance`: он запускается только при
@@ -60,14 +60,21 @@ $env:VECTORPDF_NO_RECOVERY='1'
 
 UI-прогон на том же файле (offscreen Qt):
 
-| Операция | Результат |
+| Операция | Результат (чистые прогоны) |
 | --- | ---: |
-| Открытие и первый лист | 1866 мс |
-| Apply (полный цикл) | 125 мс (metrics.edit 66 мс) |
+| Открытие и первый лист | 1866–1870 мс |
+| UI-индексация листа | 3041 мс |
+| Apply (полный цикл) | 125–324 мс (metrics.edit 61–66 мс) |
 | Undo | 94 мс |
 | Redo | 118 мс |
-| Save copy | 668 мс |
+| Save copy | 668–846 мс |
 | QPDF full check (вне UI) | 8911 мс |
+
+Независимый QA-прогон под нагрузкой дал Apply 2,87 с / Save 3,35 с; это
+измерение не используется как единственная норма. Кэш тайлов после Apply
+инвалидируется (`metrics.invalidated = 1`); дефект `invalidated == 0` найден
+независимым QA, исправлен и покрыт регрессионным тестом
+`test_render_ready_invalidates_edited_tiles`.
 
 ## Core / regression tests
 

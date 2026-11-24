@@ -538,3 +538,22 @@ def test_edit_failed_preserves_read_only_and_bridge_does_not_crash(window, tmp_p
     assert tab.busy is False
 
     tab.bridge.finish(lambda future: (_ for _ in ()).throw(RuntimeError('callback failed')), Task(None))
+
+
+def test_render_ready_invalidates_edited_tiles(window, tmp_path, monkeypatch):
+    tab = make_tab(window, tmp_path)
+    tab.current = 0
+    tab.view.set_sheet(0, tab.sheets[0], fit=False)
+    image = QImage(64, 64, QImage.Format.Format_RGB32)
+    image.fill(0xffffffff)
+    tile = Tile(0, 1.0, 0, 0)
+    tab.view.cache.put(tile, image)
+    assert tile in tab.view.cache
+    path = Path(tab.document.workspace.name) / '1.pdf'
+    old = tab.document.key
+    monkeypatch.setattr(tab.bridge, 'submit', lambda *args, **kwargs: None)
+    tab.render_ready(Task(None), old + ':1', path, {}, None,
+                     {0: [(100., 600., 200., 700.)]}, None, 1.0, tab.job_token)
+    assert tab.document.metrics.invalidated >= 1
+    assert tile not in tab.view.cache
+    tab.clear_selection()

@@ -57,6 +57,8 @@ for the item-by-item PASS / FAIL / NOT RUN evidence.
   actions.
 - Tile painting goes from low to high resolution; cache stats use `peek()`;
   global tile budget and thumbnail LRU/retry improve memory behaviour.
+- Fixed canvas cache invalidation after Apply/Undo/Redo; overlapping tiles are
+  removed immediately instead of showing stale text until zoom/page change.
 - Preview registers DejaVu/Serif/Mono/local fonts and uses the selected colour
   and bounds.
 
