@@ -36,7 +36,8 @@ QT_COMPONENTS = {
 DOCUMENTS = (
     'README.md', 'ARCHITECTURE.md', 'BENCHMARKS.md', 'TEST_RESULTS.md',
     'KNOWN_LIMITATIONS.md', 'THIRD_PARTY.md', 'THIRD_PARTY_LICENSES.txt',
-    'LICENSE', 'CHANGELOG.md', 'SECURITY.md',
+    'LICENSE', 'CHANGELOG.md', 'SECURITY.md', 'AUDIT_MATRIX.md',
+    'QA_REPORT.md', 'QA_BASELINE.md', 'requirements.lock',
 )
 
 IGNORE = shutil.ignore_patterns(

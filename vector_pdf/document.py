@@ -227,10 +227,15 @@ class LocalEditor:
             if 'original_source' in parameters:
                 options['original_source'] = source
             if 'verify' in parameters:
-                # Deep QPDF tokenization is bounded on large CAD streams; the
-                # fast path still checks geometry, signatures, untouched bytes,
-                # PDFium text and QPDF warnings.
-                options['verify'] = 'auto'
+                # Per-edit workspace versions need to stay responsive: the light
+                # path still checks structure, geometry, signatures and untouched
+                # bytes, while PDFium itself validates the attached version.  The
+                # final user-visible Save copy gets the deeper text/QPDF checks.
+                try:
+                    temporary = target.parent.resolve() == Path(document.workspace.name).resolve()
+                except OSError:
+                    temporary = False
+                options['verify'] = 'light' if temporary else 'auto'
             if 'balanced_pages' in parameters:
                 options['balanced_pages'] = {
                     number for number, index in document.indexes.items()

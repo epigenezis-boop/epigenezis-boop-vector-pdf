@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import os
 from tempfile import NamedTemporaryFile
+from threading import Lock
 
 from fontTools import subset
 from fontTools.ttLib import TTFont
@@ -360,6 +361,43 @@ def _cid_glyphs(program, descendant):
                 pass
 
 
+_PROGRAM_CACHE = {}
+_PROGRAM_LOCK = Lock()
+_PROGRAM_MISSING = object()
+
+
+def _program_key(program, unit, descendant):
+    key = [sha256(program).digest(), unit]
+    if unit == 2:
+        source = descendant.get('/CIDToGIDMap')
+        if isinstance(source, q.Stream):
+            try:
+                key.append(sha256(source.read_bytes()).digest())
+            except Exception:
+                key.append(b'?')
+        else:
+            key.append(str(source).encode())
+    return tuple(key)
+
+
+def _program_glyphs(program, unit, descendant):
+    """Parse an embedded program once per page-set; cache cmap/CID metadata."""
+    key = _program_key(program, unit, descendant)
+    with _PROGRAM_LOCK:
+        cached = _PROGRAM_CACHE.get(key, _PROGRAM_MISSING)
+    if cached is not _PROGRAM_MISSING:
+        return cached
+    if unit == 2:
+        result = _cid_glyphs(program, descendant)
+    else:
+        result = _simple_cmap(program)
+    with _PROGRAM_LOCK:
+        if len(_PROGRAM_CACHE) > 128:
+            _PROGRAM_CACHE.clear()
+        _PROGRAM_CACHE[key] = result
+    return result
+
+
 def _space_width(mapping, widths, unit):
     code = next((key for key, value in mapping.items() if value == ' ' and len(key) == unit),
                 (32).to_bytes(unit, 'big'))
@@ -444,10 +482,11 @@ def read_font(obj):
     if embedded:
         program = _font_program(descriptor)
         if program is not None:
+            parsed = _program_glyphs(program, unit, desc)
             if unit == 2:
-                num_glyphs, cid_to_gid, cid_identity = _cid_glyphs(program, desc)
+                num_glyphs, cid_to_gid, cid_identity = parsed
             else:
-                unicode_cmap = _simple_cmap(program)
+                unicode_cmap = parsed
     descender = max(-10., min(10., _number(descriptor.get('/Descent', -250), -250.)/1000))
     ascender = max(-10., min(10., _number(descriptor.get('/Ascent', 900), 900.)/1000))
     font = Font(name, mapping, widths, default, unit, bounds, embedded,

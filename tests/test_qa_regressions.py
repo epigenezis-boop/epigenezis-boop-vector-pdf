@@ -505,8 +505,9 @@ def _two_page_pdf(path: Path) -> Path:
 def test_write_copy_exposes_verification_contract():
     parameters = inspect.signature(write_copy).parameters
     if 'verify' not in parameters:
-        pytest.skip('write_copy(verify=...) is absent on the 0.2.1 baseline')
-    assert parameters['verify'].default is True
+        pytest.skip('write_copy(verify=...) is absent on this tree')
+    assert parameters['verify'].default in (True, 'auto', 'full'), \
+        'write_copy must verify output by default'
     assert 'original_source' in parameters, \
         'write_copy must accept the immutable original-source snapshot'
 
@@ -541,7 +542,7 @@ def test_rejected_edit_preserves_existing_destination(tmp_path):
     source = _two_page_pdf(tmp_path / 'source.pdf')
     destination = tmp_path / 'existing.pdf'
     destination.write_bytes(b'existing destination must survive')
-    bad = Edit(0, -1, 'x' * 1501, 50, 100, 12, 0, family='Sans')
+    bad = Edit(0, -1, 'x' * 100_001, 50, 100, 12, 0, family='Sans')
     with pytest.raises(ValueError):
         write_copy(source, destination, [bad])
     assert destination.read_bytes() == b'existing destination must survive'

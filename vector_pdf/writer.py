@@ -617,12 +617,14 @@ def write_copy(source, destination, edits, stamp=None, original_source=None,
         mode = 'full'
     elif verify == 'fast':
         mode = 'fast'
+    elif verify == 'light':
+        mode = 'light'
     else:
         # Full QPDF tokenization is very expensive on huge CAD streams.  Small
         # documents get the deep check by default; large ones still get page
         # geometry, raw untouched-stream, PDFium text and QPDF warning checks.
         try:
-            mode = 'full' if source.stat().st_size <= 2*1024**2 else 'fast'
+            mode = 'full' if source.stat().st_size <= 512*1024 else 'fast'
         except OSError:
             mode = 'fast'
     fd, tmp = tempfile.mkstemp(suffix='.pdf', prefix='.vector-', dir=destination.parent)
@@ -651,9 +653,10 @@ def write_copy(source, destination, edits, stamp=None, original_source=None,
             raise ValueError('The source file changed while saving.')
         if mode != 'none':
             expected = defaultdict(list)
-            for edit in edits:
-                if edit.text and edit.text.strip():
-                    expected[edit.page].append(edit.text)
+            if mode in ('fast', 'full'):
+                for edit in edits:
+                    if edit.text and edit.text.strip():
+                        expected[edit.page].append(edit.text)
             _validate_output(tmp, geometry, untouched, expected,
                              deep=mode == 'full', allowed_warnings=source_warnings)
         else:

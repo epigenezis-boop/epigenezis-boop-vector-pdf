@@ -1798,6 +1798,8 @@ class MainWindow(QMainWindow):
         if self.safe_mode or self.updating or self.pending_update or sys.platform != 'win32':
             return
         self.updating = True
+        if manual:
+            self.flash(self.lang.get('Проверяем обновления…', 'Checking for updates…'), 30000)
         def work():
             result = Future()
             try:
@@ -1819,6 +1821,7 @@ class MainWindow(QMainWindow):
         try:
             self.pending_update = future.result()
         except Exception as error:
+            self.flash('')
             if manual:
                 self.error(error)
             return
