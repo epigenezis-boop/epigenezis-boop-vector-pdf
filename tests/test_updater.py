@@ -1,5 +1,8 @@
 from hashlib import sha256
 from io import BytesIO
+import ssl
+from types import SimpleNamespace
+from urllib.request import HTTPSHandler
 from zipfile import ZipFile
 
 import pytest
@@ -13,6 +16,23 @@ PUBLIC = update_key.public_key(TEST_SEED)
 @pytest.fixture(autouse=True)
 def pinned_application_version(monkeypatch):
     monkeypatch.setattr(updater, 'VERSION', '0.2.1')
+
+
+def test_windows_fetch_uses_native_tls_without_disabling_verification(monkeypatch):
+    target = 'https://api.github.com/repos/' + updater.REPOSITORY + '/releases/latest'
+    response = object()
+
+    def opener(*handlers):
+        assert any(isinstance(handler, updater.GitHubRedirects) for handler in handlers)
+        https = next(handler for handler in handlers if isinstance(handler, HTTPSHandler))
+        assert isinstance(https._context, updater.truststore.SSLContext)
+        assert https._context.verify_mode == ssl.CERT_REQUIRED
+        assert https._context.check_hostname
+        return SimpleNamespace(open=lambda request, timeout: response)
+
+    monkeypatch.setattr(updater.sys, 'platform', 'win32')
+    monkeypatch.setattr(updater, 'build_opener', opener)
+    assert updater.fetch(target) is response
 
 
 def release_data(version='0.3.0'):

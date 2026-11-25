@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Verify GitHub HTTPS through the Windows system trust store so that Windows
+  can retrieve any missing intermediate certificates. Signed manifest, file
+  hash, and update origin checks continue to apply.
+
 ## 0.3.1
 
 - Click text to select the entire line as soon as a PDF opens. The toolbar uses
