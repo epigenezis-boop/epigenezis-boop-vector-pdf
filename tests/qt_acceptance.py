@@ -51,7 +51,7 @@ def run():
             p = QPointF(*point(canvas.sheet.to_screen, (l+r)/2, (b+t)/2))
             canvas.pan = QPointF(canvas.width()/2, canvas.height()/2)-p*canvas.zoom
             canvas.refresh()
-            window.change_mode('region')
+            tab.set_mode('region')
             a, b = [canvas.transform().map(QPointF(*point(canvas.sheet.to_screen, *xy))).toPoint()
                     for xy in ((l, b), (r, t))]
             QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=a)
@@ -75,7 +75,7 @@ def run():
             wait_until(app, lambda: tab.document.cursor == 1 and not tab.busy, 'redo failed')
             edit = next(iter(tab.document.edits.values()))
             tab.load_edit(edit)
-            window.change_mode('text')
+            tab.set_mode('text')
             window.canvas('rotate')
             center = QPointF(canvas.rect().center())
             origin = canvas.transform().map(QPointF(*point(canvas.sheet.to_screen, edit.x, edit.y)))

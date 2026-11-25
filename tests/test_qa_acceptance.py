@@ -396,7 +396,7 @@ def test_add_before_real_sheet_is_blocked(qapp, window, tmp_path):
     source = _pdf(tmp_path / 'add-source.pdf', pages=2)
     tab = _open(window, qapp, source)
     tab.page(1)  # placeholder sheet, render.sheet still queued
-    window.change_mode('text')
+    tab.set_mode('text')
     window.add()
     assert tab.selected is None or 1 in tab.sheet_loaded, \
         'text was added using placeholder sheet geometry'
@@ -508,11 +508,11 @@ def test_uncommitted_draft_survives_view_mode(qapp, window, monkeypatch, tmp_pat
     window, errors = window
     source = _pdf(tmp_path / 'draft-source.pdf')
     tab = _open(window, qapp, source)
-    window.change_mode('text')
+    tab.set_mode('text')
     _select_original(tab)
     _set_widget_text(tab.text, 'UNCOMMITTED DRAFT')
     asks = _record_ask(window, monkeypatch, QMessageBox.StandardButton.Cancel)
-    window.change_mode('view')
+    tab.set_mode('view')
     assert asks.calls, 'View mode did not ask about the uncommitted draft'
     assert tab.view.mode != 'view'
     assert _widget_text(tab.text) == 'UNCOMMITTED DRAFT'
