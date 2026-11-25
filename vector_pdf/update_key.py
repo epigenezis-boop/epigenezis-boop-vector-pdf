@@ -17,9 +17,9 @@ from __future__ import annotations
 import hashlib
 
 # BEGIN GENERATED KEY - rewritten by tools/update_keygen.py
-KEY_ID = 'placeholder-rfc8032-test-vector-1'
-PUBLIC_KEY_HEX = 'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a'
-IS_PLACEHOLDER = True
+KEY_ID = 'a68101dd49a6e696'
+PUBLIC_KEY_HEX = 'e8a1825cfe97c86157b45537f4e66744c99039674ec5a6cc57650164faacd6e6'
+IS_PLACEHOLDER = False
 # END GENERATED KEY
 
 # RFC 8032 test vector 1 public key.  Kept as a constant so the updater can
