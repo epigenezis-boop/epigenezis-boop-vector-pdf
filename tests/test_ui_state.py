@@ -267,11 +267,6 @@ def test_draft_is_not_lost_on_page_mode_or_close(window, tmp_path, monkeypatch):
     tab.set_mode('view')
     assert tab.view.mode == 'text'
     assert tab.text.text() == 'UNCOMMITTED FIELD CHANGE'
-    window.change_mode('view')
-    assert tab.view.mode == 'text'
-    assert window.actions['text'].isChecked()
-    assert not window.actions['view'].isChecked()
-    assert tab.text.text() == 'UNCOMMITTED FIELD CHANGE'
     window.close_tab(0)
     assert window.tabs.count() == 1
     assert tab.text.text() == 'UNCOMMITTED FIELD CHANGE'
@@ -320,18 +315,17 @@ def test_update_actions_busy_and_read_only_save(window, tmp_path):
     tab = make_tab(window, tmp_path)
     window.update_actions()
     assert window.actions['save'].isEnabled()
-    assert window.actions['text'].isEnabled()
+    assert tab.view.mode == 'text'
     assert window.actions['add'].isEnabled()
     tab.set_busy(True)
-    for key in ('save', 'text', 'region', 'add', 'undo', 'redo'):
+    for key in ('save', 'add', 'undo', 'redo'):
         assert not window.actions[key].isEnabled(), key
     tab.set_busy(False)
 
     tab.read_only = True
     window.update_actions()
     assert window.actions['save'].isEnabled()
-    for key in ('text', 'region', 'add'):
-        assert not window.actions[key].isEnabled(), key
+    assert not window.actions['add'].isEnabled()
 
     tab.document.commit({(0, -3): Edit(0, -3, 'x', 40, 40, 10, 0, family='Sans')})
     window.update_actions()
@@ -345,7 +339,7 @@ def test_read_only_tab_can_save_an_unchanged_copy(window, tmp_path, monkeypatch)
     tab.permission_checked = True
     window.update_actions()
     assert window.actions['save'].isEnabled()
-    assert not window.actions['text'].isEnabled()
+    assert not window.actions['add'].isEnabled()
     target = tmp_path / 'read-only-copy.pdf'
     monkeypatch.setattr(QFileDialog, 'getSaveFileName', staticmethod(lambda *args: (str(target), 'PDF')))
 
@@ -376,16 +370,16 @@ def test_destination_open_in_another_tab_is_rejected(window, tmp_path, monkeypat
     assert second.document.source.read_bytes() == original
 
 
-def test_tab_mode_sync_and_read_only(window, tmp_path):
+def test_text_selection_is_default_and_read_only_tabs_remain_in_view_mode(window, tmp_path):
     tab = make_tab(window, tmp_path)
-    window.mode = 'text'
-    window.sync_mode(tab)
     assert tab.view.mode == 'text'
-    assert window.actions['text'].isChecked()
+    assert tab.view.cursor().shape() == Qt.CursorShape.CrossCursor
+    assert not {'text', 'view', 'region'} & window.actions.keys()
+    for key in ('add', 'undo', 'redo', 'rotate'):
+        assert not window.actions[key].icon().isNull()
     tab.read_only = True
     window.sync_mode(tab)
     assert tab.view.mode == 'view'
-    assert window.actions['view'].isChecked()
     tab.read_only = False
 
 
@@ -419,7 +413,7 @@ def test_about_versions_plain_text_and_ready_token(window, tmp_path, monkeypatch
     assert window.status_sheet.textFormat() == Qt.TextFormat.PlainText
     assert tab.right_scroll.widget() is tab.right
     assert 'QWidget#drawing' in window.empty.styleSheet()
-    assert window.auto_update.isChecked() is False
+    assert window.auto_update.isChecked() is not ui_module.updater.update_key.IS_PLACEHOLDER
 
     signature = inspect.signature(ui_module.main)
     assert signature.parameters['ready_token'].default is None
@@ -484,7 +478,7 @@ def test_new_label_auto_applies_and_can_be_edited_and_deleted(window, app, tmp_p
     edit = tab.document.edits[key]
     assert edit.text == 'Label'
 
-    window.change_mode('view')
+    assert canvas.mode == 'text'
     xy = QPointF(*point(canvas.sheet.to_screen, edit.x+2, edit.y+3))
     position = canvas.transform().map(xy).toPoint()
     QTest.mouseDClick(canvas, Qt.MouseButton.LeftButton, pos=position)

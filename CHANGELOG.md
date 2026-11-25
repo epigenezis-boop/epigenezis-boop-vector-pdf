@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- Click text to select the entire line as soon as a PDF opens. The toolbar uses
+  new icons for adding text, undo, redo, and rotating the view.
+- Windows builds use the production Ed25519 key for updates. Automatic
+  downloads are enabled by default in trusted builds, with installation on
+  the next launch. Existing 0.3.0 installations require a one-time manual
+  upgrade to establish trust in the new key.
+
 ## 0.3.0 — hardening release (24 Nov 2026)
 
 This release does not add product features. It fixes defects confirmed by the

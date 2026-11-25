@@ -32,6 +32,7 @@ from .document import (
 )
 from .geometry import box, compose, point
 from .palette import STRIPES, THEMES, stylesheet
+from .toolbar_icons import TOOL_ICONS, toolbar_icon
 from .render import RenderEngine, TileCache
 from .fonts import ASSETS, FALLBACKS, import_font, learn_fonts
 from .version import REPOSITORY, VERSION
@@ -498,7 +499,6 @@ class Workspace(QWidget):
                 task.result()
             except Exception as error:
                 self.read_only = True
-                self.view.set_mode('view')
                 self.notice('Только просмотр. '+str(error), 'Read-only. '+str(error))
             self.status()
             self.window.sync_mode(self)
@@ -528,9 +528,6 @@ class Workspace(QWidget):
             self.pages.blockSignals(False)
         self.view_states.clear()
         self.view.set_sheet(0, self.sheets[0])
-        if not self.read_only:
-            self.notice('Выберите «Текст» или «Область», чтобы начать правку.',
-                        'Choose Text or Area to begin editing.')
         self.window.sync_mode(self)
         self.status()
         self.view.refresh()
@@ -917,8 +914,6 @@ class Workspace(QWidget):
             x, y = xy
             try:
                 choice = min(runs.values(), key=lambda edit: hit_distance(edit, x, y))
-                if focus_text and self.view.mode != 'text':
-                    self.window.change_mode('text')
                 if self.load_edit(choice) and focus_text and self.form.isEnabled():
                     self.auto_apply = True
                     self.text.setFocus(Qt.FocusReason.MouseFocusReason)
@@ -1660,7 +1655,6 @@ class MainWindow(QMainWindow):
         self.render = RenderEngine()
         self.editor = LocalEditor()
         self.actions = {}
-        self.mode = 'view'
         self.updating = False
         self.pending_update = None
         self.restart_requested = False
@@ -1689,31 +1683,20 @@ class MainWindow(QMainWindow):
         for name, ru, en, slot, shortcuts in [
             ('open', 'Открыть', 'Open', self.open_dialog, 'Ctrl+O'),
             ('save', 'Сохранить копию', 'Save copy', lambda: self.call('save'), 'Ctrl+Shift+S'),
-            ('undo', '↶', '↶', lambda: self.call('travel', -1), 'Ctrl+Z'),
-            ('redo', '↷', '↷', lambda: self.call('travel', 1), 'Ctrl+Y'),
+            ('undo', 'Отменить', 'Undo', lambda: self.call('travel', -1), 'Ctrl+Z'),
+            ('redo', 'Повторить', 'Redo', lambda: self.call('travel', 1), 'Ctrl+Y'),
         ]:
             self.button(row, name, ru, en, slot, shortcuts)
-        self.lang.bind(self.actions['undo'].setToolTip, 'Отменить', 'Undo')
-        self.lang.bind(self.actions['redo'].setToolTip, 'Повторить', 'Redo')
-        row.addStretch()
+        self.button(row, 'add', 'Добавить текст', 'Add text', self.add)
         row = header.tools
-        self.mode_group = QActionGroup(self)
-        self.mode_group.setExclusive(True)
-        for name, ru, en in [('view', 'Просмотр', 'View'), ('text', 'Текст', 'Text'), ('region', 'Область', 'Area')]:
-            action = self.button(row, name, ru, en, lambda mode=name: self.change_mode(mode))
-            action.setCheckable(True)
-            self.mode_group.addAction(action)
-        self.actions['view'].setChecked(True)
-        self.button(row, 'add', '+ Текст', '+ Text', self.add)
         row.addStretch()
         for name, ru, en, fn in [
             ('minus', '−', '−', lambda: self.canvas('zoom_at', 1/1.24)),
             ('plus', '+', '+', lambda: self.canvas('zoom_at', 1.24)),
             ('fit', 'По листу', 'Fit sheet', lambda: self.canvas('fit')),
-            ('rotate', '↻', '↻', lambda: self.canvas('rotate')),
+            ('rotate', 'Повернуть вид на 90°', 'Rotate the view by 90°', lambda: self.canvas('rotate')),
         ]:
             self.button(row, name, ru, en, fn)
-        self.lang.bind(self.actions['rotate'].setToolTip, 'Повернуть вид на 90°', 'Rotate the view by 90°')
         vertical.addWidget(header)
         vertical.addWidget(Ribbon())
 
@@ -1785,7 +1768,13 @@ class MainWindow(QMainWindow):
         self.actions[name] = action
         button = QToolButton()
         button.setDefaultAction(action)
-        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        if name in TOOL_ICONS:
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setIconSize(QSize(21, 21))
+            self.lang.bind(action.setToolTip, ru, en)
+            self.lang.bind(button.setAccessibleName, ru, en)
+        else:
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         if name == 'open':
             button.setObjectName('primary')
         layout.addWidget(button)
@@ -1854,7 +1843,8 @@ class MainWindow(QMainWindow):
         self.auto_update = menu.addAction('')
         self.lang.bind(self.auto_update.setText, 'Загружать автоматически', 'Download automatically')
         self.auto_update.setCheckable(True)
-        self.auto_update.setChecked(self.settings.value('auto-update', False, type=bool))
+        automatic = not updater.update_key.IS_PLACEHOLDER
+        self.auto_update.setChecked(self.settings.value('auto-update', automatic, type=bool))
         self.auto_update.toggled.connect(lambda flag: self.settings.setValue('auto-update', flag))
         self.restart_update = menu.addAction('')
         self.lang.bind(self.restart_update.setText, 'Перезапустить и обновить', 'Restart and update')
@@ -1991,6 +1981,8 @@ class MainWindow(QMainWindow):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
         self.setStyleSheet(stylesheet(self.appearance))
+        for name in TOOL_ICONS:
+            self.actions[name].setIcon(toolbar_icon(name, self.appearance))
         self.empty.setStyleSheet('QWidget#drawing { background: '+self.surface+'; }')
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
@@ -2005,7 +1997,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue('language', code)
         tab = self.current_tab()
         if tab and not tab.busy and not tab.has_draft():
-            tab.set_mode(self.mode, prompt=False)
+            tab.set_mode(tab.view.mode, prompt=False)
         self.update_status()
         self.show_metrics()
 
@@ -2022,66 +2014,15 @@ class MainWindow(QMainWindow):
             return getattr(tab.view, name)(*args)
         return None
 
-    def sync_mode(self, tab=None):
-        tab = tab or self.current_tab()
-        if tab is None:
-            return
-        mode = self.mode
-        if tab.read_only or not tab.sheets:
-            mode = 'view'
-        if tab.has_draft() and mode in ('view', 'region') and mode != tab.view.mode:
-            actual = self.actions.get(tab.view.mode)
-            if actual is not None:
-                actual.setChecked(True)
-            return
-        action = self.actions.get(mode)
-        if action is not None:
-            action.setChecked(True)
-        if not tab.sheets:
-            tab.view.set_mode('view')
-            return
-        try:
+    def sync_mode(self, tab):
+        mode = 'text' if tab.sheets and tab.permission_checked and not tab.read_only else 'view'
+        if mode != tab.view.mode:
             tab.set_mode(mode, prompt=False)
-        except RuntimeError:
-            pass
-
-    def _set_global_mode(self, mode):
-        self.mode = mode
-        action = self.actions.get(mode)
-        if action is not None:
-            action.setChecked(True)
-
-    def change_mode(self, mode):
-        tab = self.current_tab()
-        if tab and tab.busy:
-            self.flash(self.lang.get('Дождитесь окончания операции.', 'Wait for the current operation.'))
-            return
-        if tab and tab.read_only:
-            self.mode = mode
-            self.actions['view'].setChecked(True)
-            tab.set_mode('view')
-            return
-        if (tab and mode in ('view', 'region') and mode != tab.view.mode
-                and tab.has_draft()):
-            def apply_mode():
-                self._set_global_mode(mode)
-                tab.set_mode(mode, prompt=False)
-            tab.resolve_draft(apply_mode)
-            actual = self.actions.get(tab.view.mode)
-            if actual is not None:
-                actual.setChecked(True)
-            return
-        self._set_global_mode(mode)
-        if tab:
-            tab.set_mode(mode, prompt=False)
-        self.update_actions()
 
     def add(self):
         tab = self.current_tab()
-        if tab is None or tab.busy or tab.read_only:
-            return
-        self.change_mode('text')
-        tab.add()
+        if tab is not None and not tab.busy and not tab.read_only:
+            tab.add()
 
     def toggle_thumbs(self, state):
         for i in range(self.tabs.count()):
@@ -2097,10 +2038,8 @@ class MainWindow(QMainWindow):
         idle = bool(ready and not tab.busy)
         editing = bool(idle and tab.permission_checked and not tab.read_only)
         save_ok = bool(idle and (not tab.read_only or not tab.document.edits))
-        for key in ('view', 'fit', 'plus', 'minus', 'rotate'):
+        for key in ('fit', 'plus', 'minus', 'rotate'):
             self.actions[key].setEnabled(ready)
-        for key in ('text', 'region'):
-            self.actions[key].setEnabled(editing)
         self.actions['save'].setEnabled(save_ok)
         self.actions['add'].setEnabled(editing)
         self.actions['undo'].setEnabled(editing and tab.document.cursor > 0)

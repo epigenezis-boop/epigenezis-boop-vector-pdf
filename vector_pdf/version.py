@@ -1,2 +1,2 @@
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 REPOSITORY = 'epigenezis-boop/epigenezis-boop-vector-pdf'
