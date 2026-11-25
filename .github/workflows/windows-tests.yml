@@ -61,8 +61,8 @@ jobs:
           cmd.exe /c build-launcher.cmd
           if ($LASTEXITCODE) { throw 'Launcher build failed.' }
           $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path VectorPDF.exe))
-          if ($info.FileVersion -ne '0.3.0.0') { throw "Unexpected launcher FileVersion: $($info.FileVersion)" }
-          if ($info.ProductVersion -ne '0.3.0.0') { throw "Unexpected launcher ProductVersion: $($info.ProductVersion)" }
+          if ($info.FileVersion -ne "$version.0") { throw "Unexpected launcher FileVersion: $($info.FileVersion)" }
+          if ($info.ProductVersion -ne "$version.0") { throw "Unexpected launcher ProductVersion: $($info.ProductVersion)" }
           if ($info.ProductName -ne 'VECTOR PDF') { throw "Unexpected ProductName: $($info.ProductName)" }
       - name: Package smoke test
         shell: pwsh

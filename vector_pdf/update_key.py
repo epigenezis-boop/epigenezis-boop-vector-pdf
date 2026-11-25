@@ -4,16 +4,10 @@ The release archive is authenticated with a detached Ed25519 signature over the
 canonical bytes of ``manifest.json``.  Verification lives here so the portable
 build does not need a new runtime dependency.
 
-IMPORTANT: the public key generated into the block below is a *test/placeholder*
-key (RFC 8032 test vector 1).  Its secret key is public knowledge, therefore the
-updater refuses to trust it.  Before automatic updates may be enabled the owner
-must generate a production key outside the repository and install only its
-public half::
+The RFC 8032 placeholder key is reserved for tests and is never trusted by
+the updater. The generated block holds the public release key. Keep the
+private key outside the repository and out of release packages.
 
-    python tools/update_keygen.py --private-key %USERPROFILE%\\vector-update.key \\
-        --module vector_pdf/update_key.py
-
-The private key must never be committed, copied into the repository or shipped.
 Sign manifests with:
 
     python tools/sign_manifest.py release/manifest.json --key <private-key>

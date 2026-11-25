@@ -1,26 +1,27 @@
-# VECTOR PDF 0.3.0
+# Vector 0.3.1
 
 Нативный редактор инженерных PDF для Windows 11 x64 и Linux. Открывает PDF в
 нескольких вкладках и меняет поддерживаемый текст, сохраняя результат в
 отдельную векторную копию. Исходный PDF никогда не перезаписывается.
 
-Версия 0.3 — hardening-выпуск по независимому аудиту 0.2.1. Новых функций нет:
-исправлены повреждение текста, потеря правок, ложный read-only, обновление с
-«окирпичиванием» и релизные пробелы. Полный список — в `CHANGELOG.md`.
+В версии 0.3.1 выбор текста доступен сразу после открытия PDF. В Windows включена автоматическая загрузка подписанных обновлений. Подробности в [списке изменений](CHANGELOG.md).
 
 ## Запуск в Windows
 
-[Релиз Vector 0.3.0 на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/tag/v0.3.0) · [Скачать ZIP для Windows x64](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/download/v0.3.0/Vector-0.3.0-Windows-x64-Portable.zip)
+[Релиз Vector 0.3.1 на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/tag/v0.3.1) · [Скачать ZIP для Windows x64](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/download/v0.3.1/VECTOR-PDF-0.3.1-win-x64.zip)
 
-Распакуйте архив `Vector-0.3.0-Windows-x64-Portable.zip` целиком и запустите
+Распакуйте архив `VECTOR-PDF-0.3.1-win-x64.zip` целиком и запустите
 `VectorPDF.exe`. В комплекте CPython 3.12.10 и библиотеки; установка, права
 администратора и отдельный Python не нужны.
 
-Автоматическая установка обновлений **выключена по умолчанию**. Проверка
-обновлений доступна вручную в меню «Обновления». Обновление принимается только
-при наличии подписанного Ed25519 манифеста, полного списка хэшей, исправного
-staged-runtime и подтверждения запуска; иначе выполняется откат. Пока владелец
-проекта не установит production-ключ, обновления fail-closed и не ставятся.
+Если вы пользуетесь версией 0.3.0, один раз распакуйте 0.3.1 в новую папку
+и запускайте её. Версия 0.3.0 ещё не содержит рабочего ключа проверки подписи.
+
+При запуске Windows-версия проверяет обновления и загружает их автоматически,
+если включён пункт «Загружать автоматически» в меню «Обновления» (по умолчанию
+включён). Доступна и ручная проверка. Подписанный Ed25519 манифест и хэши
+проверяются перед установкой. Обновление применяется при следующем запуске.
+Если новая версия не подтверждает запуск, приложение выполняет откат.
 
 Цифровая подпись Authenticode в этом окружении недоступна; локальная сборка
 считается неподписанной. CI подписывает EXE только при наличии сертификата в
@@ -29,10 +30,8 @@ staged-runtime и подтверждения запуска; иначе выпо
 ## Первая правка
 
 1. Откройте PDF через **Открыть** или перетащите в окно.
-2. Приблизьте участок колесом. Левая кнопка в режиме **Просмотр** или средняя
-   кнопка в любом режиме перемещает лист.
-3. Включите **Область** и обведите участок; выберите текст в панели свойств.
-   Режим **Текст** выбирает объект по щелчку.
+2. Приблизьте участок колесом. Перемещайте лист, удерживая среднюю кнопку мыши.
+3. Щёлкните по строке, чтобы выделить её целиком, или дважды щёлкните для ввода.
 4. Измените текст, размер, угол, наклон, цвет или шрифт. Перетаскивание рамки
    перемещает надпись. Нажмите **Применить**.
 5. Нажмите **Сохранить копию** и укажите новое имя PDF. Если имя без `.pdf`,
@@ -117,7 +116,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 python -m pip download --platform win_amd64 --implementation cp --python-version 3.12 --abi cp312 --only-binary=:all: -r requirements.txt -d wheels
 curl.exe --fail --location --output python-embed.zip https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip
 python tools/sbom.py --output release/sbom.json
-python tools/package_windows.py python-embed.zip wheels VectorPDF.exe release/VECTOR-PDF-0.3.0-win-x64.zip --manifest release/manifest.json --sbom release/sbom.json
+python tools/package_windows.py python-embed.zip wheels VectorPDF.exe release/VECTOR-PDF-0.3.1-win-x64.zip --manifest release/manifest.json --sbom release/sbom.json
 ```
 
 Лаунчер собирается из `tools/launcher_windows.c` с `/GS`, PE-манифестом и
