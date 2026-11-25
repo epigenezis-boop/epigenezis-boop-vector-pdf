@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import stat
 import struct
 import subprocess
@@ -37,9 +38,11 @@ import sys
 from tempfile import TemporaryDirectory, mkstemp
 import time
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
+
+import truststore
 
 from . import update_key
 from .version import REPOSITORY, VERSION
@@ -163,9 +166,13 @@ class GitHubRedirects(HTTPRedirectHandler):
 
 
 def fetch(url):
-    return build_opener(GitHubRedirects()).open(
-        Request(trusted(url), headers={'User-Agent': f'VECTOR-PDF/{VERSION}'}),
-        timeout=25)
+    request = Request(trusted(url), headers={'User-Agent': f'VECTOR-PDF/{VERSION}'})
+    handlers = [GitHubRedirects()]
+    if sys.platform == 'win32':
+        # Windows can complete certificate chains with missing intermediates.
+        context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        handlers.append(HTTPSHandler(context=context))
+    return build_opener(*handlers).open(request, timeout=25)
 
 
 @dataclass(frozen=True)

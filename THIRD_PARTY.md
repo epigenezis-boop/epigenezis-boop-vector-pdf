@@ -22,6 +22,7 @@
 | fontTools 4.68.0, DejaVu | MIT для fontTools, Bitstream Vera и условия DejaVu для шрифтов. Текст лицензии шрифтов в `vector_pdf/assets`. [fontTools](https://github.com/fonttools/fonttools) · [DejaVu](https://dejavu-fonts.github.io/License.html) |
 | Rtree 1.4.1, libspatialindex | MIT, уведомления в комплекте. [Rtree](https://github.com/Toblerity/rtree) · [libspatialindex](https://github.com/libspatialindex/libspatialindex) |
 | psutil, Pillow, lxml, packaging | BSD-3-Clause, MIT-CMU, BSD-3-Clause, Apache-2.0/BSD-2-Clause соответственно. Лицензии в метаданных колёс. |
+| truststore 0.10.5 | MIT. Лицензия в метаданных колеса. [Исходники](https://github.com/sethmlarson/truststore) |
 
 Microsoft Visual C++ Runtime поставляется в колёсах Qt и в штатном
 интерпретаторе Python в формах, выпущенных их поставщиками.

@@ -1,21 +1,23 @@
-# Vector 0.3.1
+# Vector 0.3.2
 
 Нативный редактор инженерных PDF для Windows 11 x64 и Linux. Открывает PDF в
 нескольких вкладках и меняет поддерживаемый текст, сохраняя результат в
 отдельную векторную копию. Исходный PDF никогда не перезаписывается.
 
-В версии 0.3.1 выбор текста доступен сразу после открытия PDF. В Windows включена автоматическая загрузка подписанных обновлений. Подробности в [списке изменений](CHANGELOG.md).
+В версии 0.3.2 выбор текста доступен сразу после открытия PDF. В Windows включена автоматическая загрузка подписанных обновлений. Подробности в [списке изменений](CHANGELOG.md).
 
 ## Запуск в Windows
 
-[Релиз Vector 0.3.1 на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/tag/v0.3.1) · [Скачать ZIP для Windows x64](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/download/v0.3.1/VECTOR-PDF-0.3.1-win-x64.zip)
+[Релиз Vector 0.3.2 на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/tag/v0.3.2) · [Скачать ZIP для Windows x64](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/download/v0.3.2/VECTOR-PDF-0.3.2-win-x64.zip)
 
-Распакуйте архив `VECTOR-PDF-0.3.1-win-x64.zip` целиком и запустите
+Распакуйте архив `VECTOR-PDF-0.3.2-win-x64.zip` целиком и запустите
 `VectorPDF.exe`. В комплекте CPython 3.12.10 и библиотеки; установка, права
 администратора и отдельный Python не нужны.
 
-Если вы пользуетесь версией 0.3.0, один раз распакуйте 0.3.1 в новую папку
+Если вы пользуетесь версией 0.3.0, один раз распакуйте 0.3.2 в новую папку
 и запускайте её. Версия 0.3.0 ещё не содержит рабочего ключа проверки подписи.
+Если версия 0.3.1 сообщает об ошибке HTTPS при проверке обновлений,
+тоже перейдите на 0.3.2 вручную.
 
 При запуске Windows-версия проверяет обновления и загружает их автоматически,
 если включён пункт «Загружать автоматически» в меню «Обновления» (по умолчанию
@@ -116,7 +118,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 python -m pip download --platform win_amd64 --implementation cp --python-version 3.12 --abi cp312 --only-binary=:all: -r requirements.txt -d wheels
 curl.exe --fail --location --output python-embed.zip https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip
 python tools/sbom.py --output release/sbom.json
-python tools/package_windows.py python-embed.zip wheels VectorPDF.exe release/VECTOR-PDF-0.3.1-win-x64.zip --manifest release/manifest.json --sbom release/sbom.json
+python tools/package_windows.py python-embed.zip wheels VectorPDF.exe release/VECTOR-PDF-0.3.2-win-x64.zip --manifest release/manifest.json --sbom release/sbom.json
 ```
 
 Лаунчер собирается из `tools/launcher_windows.c` с `/GS`, PE-манифестом и

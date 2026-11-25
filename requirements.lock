@@ -1,4 +1,4 @@
-# Runtime dependency lock for VECTOR PDF 0.3.0 (Windows x64 / CPython 3.12).
+# Runtime dependency lock for Vector 0.3.2 (Windows x64 / CPython 3.12).
 # Direct requirements are pinned in requirements.txt; transitive versions are
 # pinned here for reproducible offline packaging.
 PySide6-Essentials==6.10.3
@@ -11,3 +11,4 @@ packaging==26.4
 fonttools==4.68.0
 rtree==1.4.1
 psutil==7.2.2
+truststore==0.10.5
