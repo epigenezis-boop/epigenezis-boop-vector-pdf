@@ -6,9 +6,19 @@
 
 В версии 0.3.2 выбор текста доступен сразу после открытия PDF. В Windows включена автоматическая загрузка подписанных обновлений. Подробности в [списке изменений](CHANGELOG.md).
 
-## Запуск в Windows
-
 [Релиз Vector 0.3.2 на GitHub](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/tag/v0.3.2) · [Скачать ZIP для Windows x64](https://github.com/epigenezis-boop/epigenezis-boop-vector-pdf/releases/download/v0.3.2/VECTOR-PDF-0.3.2-win-x64.zip)
+
+## Интерфейс
+
+![Vector в теме «Солнечная Orbita». Лист PDF и миниатюры страниц](docs/screenshots/vector-view.png)
+
+Лист PDF в режиме подгонки по окну, слева миниатюры страниц.
+
+![Vector в тёмной теме. Строка выделена, поле текста активно](docs/screenshots/vector-text.png)
+
+Двойной щелчок выделяет строку и переводит фокус в поле «Текст».
+
+## Запуск в Windows
 
 Распакуйте архив `VECTOR-PDF-0.3.2-win-x64.zip` целиком и запустите
 `VectorPDF.exe`. В комплекте CPython 3.12.10 и библиотеки; установка, права
